@@ -52,18 +52,53 @@ bd close <id>         # Complete work
 
 ## Build & Test
 
-_Add your build and test commands here_
-
 ```bash
-# Example:
-# npm install
-# npm test
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo build --release
+cargo test --release --no-fail-fast
 ```
+
+Installer checks (only if installer/bootstrap files changed):
+- Windows: `.\tests\test-install.ps1`
+- POSIX: `bash ./tests/test-install.sh`
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+Qartez is a **local-first, agent-first code intelligence MCP server** written in Rust.
+It provides AST-based code intelligence (indexing, parsing, search, dependency analysis)
+to AI coding agents via the MCP protocol.
+
+Key binaries:
+- `qartez` — main MCP server
+- `qartez-guard` — edit guard sidecar
+- `qartez-setup` — bootstrap/setup utility
+- `benchmark` — performance benchmarking
+
+## Code Exploration
+
+**Use Qartez MCP tools for all source-code exploration.** Do not use raw grep/read for code when Qartez tools are available.
+
+| Task | Tool |
+|---|---|
+| Project structure | `qartez_map` |
+| Symbol/text search | `qartez_grep` |
+| Jump to definition | `qartez_find` |
+| Read source code | `qartez_read` |
+| Related files | `qartez_context` |
+| Blast radius before editing | `qartez_impact` |
+| Call hierarchy | `qartez_calls` |
+| Dependencies | `qartez_deps` |
+| Symbol references | `qartez_refs` |
+| Run tests/build | `qartez_project` |
+
+**Before editing load-bearing files** (high PageRank or large blast radius), run `qartez_impact` first.
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+- Rust 2024 edition, Rust 1.88+
+- Local-first: never introduce mandatory external services
+- Explicit readiness/error states over silent partial results
+- Keep changes minimal and lane-focused
+- Update `.allium/qartez-indexing-improvements.allium` when observable behaviour changes
+- Use Beads (`bd`) for all task tracking — not TodoWrite or markdown TODOs

@@ -1,0 +1,123 @@
+{
+  "nodes": [
+    {
+      "key": "baseline",
+      "title": "Capture baseline metrics and add acceptance harness",
+      "type": "task",
+      "priority": 0,
+      "parent": "qartez-mcp-latest-d6j",
+      "description": "Add regression coverage for the Allium indexing/runtime behaviour contract before major implementation lanes begin. This is the first executable task — it turns the Allium contract into guardrails before changing runtime architecture.\n\n## Scope\n\n- Create tests that assert cold-start readiness behaviour (queries during indexing return deferred/not-ready, not empty success).\n- Create tests that assert deterministic indexing output (same input → same output across runs).\n- Create tests that assert watcher/indexer eligibility parity (same files supported by both).\n- Create tests that assert writer chunk boundedness (chunks never exceed configured writer_chunk_size).\n- Create tests that assert shared DB lifecycle metadata is queryable (stats, root counts, maintenance timestamps).\n- Create tests that assert hot-file reparse fallback correctness (cache miss → cold parse, never stale-tree bug).\n\n## Allium sections covered\n\n- QueryDefersUntilIndexIsUsable\n- QueryServesFromReadyOrPartialIndex\n- InitialIndexQueuesOnlySupportedFiles\n- WatcherUsesTheSameEligibilityPolicyAsTheIndexer\n- WriterCreatesBoundedChunks\n- ReadyTasksJoinChunksUntilSizeLimit\n- HotFilesPreferIncrementalReparse\n- IncrementalChangeFallsBackToColdParse\n- ProjectReturnsToReadyWhenPendingWorkDrains\n- SharedProjectBecomesStaleWhenMissingOnDisk\n- SharedProjectBecomesStaleWhenInactive\n- StaleProjectsArePrunedOnlyWhenIdle\n\n## Invariants to test\n\n- QueriesAreOnlyServedFromUsableIndexes\n- UnsupportedFilesNeverProduceParseTasks\n- IncrementalTasksAreAlwaysClassified\n- ChunksRemainBounded\n- PrunedProjectsHaveNoPendingWork",
+      "acceptance": "- Cold-start readiness behaviour is tested: queries during cold_start/indexing/maintenance return deferred status with retry_after.\n- Deterministic indexing output is tested: same repo indexed twice produces identical results.\n- Watcher/indexer eligibility parity is tested: supported-file rules produce same results in both paths.\n- Writer chunk boundedness is tested: no chunk exceeds config.writer_chunk_size (50).\n- Shared DB lifecycle metadata is testable: stats endpoint returns DB size, root counts, maintenance timestamps.\n- Hot-file reparse fallback is tested: cache miss triggers cold parse, never produces incorrect results.\n- All Allium invariants have at least one test exercising them.",
+      "context": "Primary docs: .allium/qartez-indexing-improvements.allium (all rules and invariants). Implementation playbook: docs/agents/high-roi-implementation-playbook.md (lane descriptions). This task must land BEFORE any architecture changes to provide a safety net.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "readiness-contract",
+      "title": "Add explicit readiness signalling and partial-result contract",
+      "type": "task",
+      "priority": 1,
+      "parent": "qartez-mcp-latest-d6j",
+      "deps": ["blocked-by:baseline"],
+      "description": "Implement explicit readiness states so that tool queries during cold start, indexing, or maintenance receive a structured deferred response instead of silently returning empty results.\n\n## Behavioural claims\n\n- When a project is in cold_start, indexing, or maintenance readiness, queries are deferred with a retry_after duration.\n- When a project is in ready or partial_reindex and the reader pool is ready, queries are served.\n- Partial completeness is reported when serving from a partial_reindex state.\n- The DatabaseCatalog transitions from opening→ready before queries are served.\n\n## Implementation areas\n\n- DatabaseCatalog state machine: opening → ready\n- ProjectIndex readiness states: cold_start → indexing → ready / partial_reindex / maintenance / failed\n- QuerySession lifecycle: waiting_for_readiness → deferred | served | rejected\n- MCP tool response format: include readiness status and retry_after when deferred",
+      "acceptance": "- Cold-start query before index completion returns explicit deferred/not-ready status with retry_after duration, not empty success.\n- Tool reads can proceed while writer activity is active when a usable index exists (ready or partial_reindex state).\n- Partial completeness is reported in query responses during partial_reindex.\n- DatabaseCatalog reader_pool transitions from warming to ready before any query is served.\n- All readiness state transitions are covered by tests from the baseline harness.",
+      "context": "Allium rules: DatabaseCatalogOpens, ReaderPoolBecomesReadyBeforeQueriesAreServed, ToolQueryCreatesSession, QueryDefersUntilIndexIsUsable, QueryServesFromReadyOrPartialIndex. Config: readiness_retry_after = 2.seconds.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "db-split",
+      "title": "Split SQLite access into dedicated writer path plus read pool",
+      "type": "task",
+      "priority": 1,
+      "parent": "qartez-mcp-latest-d6j",
+      "deps": ["blocked-by:baseline", "blocked-by:readiness-contract"],
+      "description": "Separate the SQLite access path so that indexing, watcher writes, prune, and compact operations use one controlled writer path, while tool handlers use a read pool. This prevents heavy write activity from starving read requests.\n\n## Goals\n\n- One writer path for all mutation operations (indexing, watcher, prune, compact).\n- Read pool for tool handler queries.\n- Writer state is visible: idle | full_indexing | incremental_indexing | pruning | compacting | blocked.\n- Read pool state is visible: warming | ready | degraded.\n- No silent empty results during write-heavy periods.\n\n## Anti-goals\n\n- Do not add mandatory external database services.\n- Do not hide transient not-ready conditions behind empty results.",
+      "acceptance": "- Indexing, watcher, prune, and compact all use one controlled writer path.\n- Tool reads can proceed concurrently when writer is active and a usable index exists.\n- Writer state is queryable and visible to callers (idle, full_indexing, incremental_indexing, pruning, compacting, blocked).\n- Read pool state is queryable (warming, ready, degraded).\n- Heavy writer activity does not starve read requests — read latency remains bounded.\n- Tests prove read/write isolation under concurrent load.",
+      "context": "Allium entity: DatabaseCatalog with writer_state and reader_pool fields. Implementation playbook Lane 1. Hotspots: startup/index orchestration, server DB wiring, watcher/index writer path, tool-handler read path.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "watcher-parity-chunking",
+      "title": "Unify watcher eligibility with indexer logic and chunk writer commits",
+      "type": "task",
+      "priority": 1,
+      "parent": "qartez-mcp-latest-d6j",
+      "deps": ["blocked-by:db-split"],
+      "description": "Make watcher and indexer agree on which files are supported, and split heavy watcher write batches into bounded chunks that are fair to readers.\n\n## Behavioural claims\n\n- Watcher uses the same SupportedSourcePath.matches eligibility check as the indexer.\n- Deleted files are always eligible (for cleanup).\n- Watch batches move through states: queued → preparing → parsing → writing → completed | failed.\n- Write chunks are bounded by config.writer_chunk_size (50).\n- Ready parse tasks join chunks until the size limit is reached.\n- Each chunk is committed separately, yielding to readers between commits.\n\n## Implementation areas\n\n- src/watch.rs: watcher event batching and eligibility filtering\n- Shared supported-file logic between watcher and indexer\n- WriteChunk creation and task assignment\n- Chunk commit loop with reader yield points",
+      "acceptance": "- Watcher and indexer agree on supported files — same eligibility rules produce identical results.\n- Special filenames (spaces, unicode, long paths) stay fresh under watcher.\n- Write chunks remain at or below config.writer_chunk_size (50).\n- Branch switches or large watcher bursts do not monopolize the DB for long stretches.\n- Read latency remains bounded during large watcher bursts.\n- WatchBatch state transitions are correct: queued → preparing → parsing → writing → completed/failed.",
+      "context": "Allium rules: WatcherUsesTheSameEligibilityPolicyAsTheIndexer, SupportedWatchItemsCreateIncrementalParseTasks, WriterCreatesBoundedChunks, ReadyTasksJoinChunksUntilSizeLimit, WriterCommitsEachChunkSeparately, CommittedChunkYieldsToReaders. Config: writer_chunk_size = 50, large_watch_batch_threshold = 200.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "parser-workers",
+      "title": "Replace mutexed parser with thread-local, lazy-loaded parser workers",
+      "type": "task",
+      "priority": 1,
+      "parent": "qartez-mcp-latest-d6j",
+      "deps": ["blocked-by:baseline"],
+      "description": "Remove the single Mutex<Parser> bottleneck by creating thread-local, lazy-loaded parser workers per language. Rust-only repos should not pay startup cost for absent languages.\n\n## Behavioural claims\n\n- ParseWorker is created per project_index with a thread_key and language.\n- Parser state is loaded lazily by language on first use.\n- Workers transition: idle → loading_language → parsing → idle (or evicted after TTL).\n- Idle workers may be evicted after config.parser_idle_ttl (15 minutes).\n- ParseTask claims a worker for its source file's language.\n\n## Anti-goals\n\n- Do not eagerly initialize all supported grammars.\n- Do not introduce non-deterministic parser sharing bugs.",
+      "acceptance": "- Parser state is loaded lazily by language — no parser is created until its first parse task.\n- Rust-only repos do not pay meaningful startup cost for absent languages (Python, Go, etc.).\n- Parallel parse workers do not deadlock or serialize on one global parser lock.\n- Parser metrics or tests prove per-language lazy activation.\n- Idle workers are evicted after config.parser_idle_ttl (15 minutes) of inactivity.\n- Worker state transitions are correct: idle → loading_language → parsing → idle → evicted.",
+      "context": "Allium rules: ParseTaskClaimsThreadLocalWorkerForLanguage, WorkerLoadsLanguageOnDemand, IdleWorkerMayBeEvicted. Config: parser_idle_ttl = 15 minutes. Hotspots: src/index/parser.rs, parser call sites in src/index/mod.rs.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "parallel-full-index",
+      "title": "Parallelize full-index parse and extract while keeping DB writes serialized",
+      "type": "task",
+      "priority": 1,
+      "parent": "qartez-mcp-latest-d6j",
+      "deps": ["blocked-by:parser-workers", "blocked-by:db-split"],
+      "description": "Parallelize the full-index parse/extract phase using the new thread-local parser workers, while keeping DB writes serialized or batched deterministically through the chunk writer.\n\n## Goals\n\n- File parse and extract operations run in parallel across available workers.\n- DB writes remain serialized through WriteChunk commits.\n- Output ordering is deterministic where downstream behaviour depends on it.\n- No direct SQLite writes from individual workers.\n\n## Anti-goals\n\n- Do not write to SQLite directly from every worker.\n- Do not change output ordering in a way that destabilizes deterministic downstream behaviour.",
+      "acceptance": "- Full-index wall-clock time drops materially on representative repos (measured against baseline).\n- Result sets remain stable across repeated runs — no nondeterministic output drift.\n- DB writes are not performed directly from workers — all go through WriteChunk.\n- Output ordering remains deterministic for downstream consumers.\n- Parse tasks transition correctly: queued → parsing → ready_to_write → written.",
+      "context": "Allium rules: InitialIndexQueuesOnlySupportedFiles, ParsedTasksBecomeWriteReadyAndRefreshHotTree, WriterCreatesBoundedChunks, ReadyTasksJoinChunksUntilSizeLimit, WriterCommitsEachChunkSeparately. Hotspot: src/index/mod.rs.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "hot-incremental-reparse",
+      "title": "Add hot-file incremental reparsing using cached Tree state",
+      "type": "task",
+      "priority": 1,
+      "parent": "qartez-mcp-latest-d6j",
+      "deps": ["blocked-by:parser-workers", "blocked-by:watcher-parity-chunking"],
+      "description": "Reuse recent syntax Tree state for watcher-driven edits to achieve faster reindexing on hot files, with safe fallback to cold parse when the cached tree is unavailable or invalid.\n\n## Behavioural claims\n\n- SourceFile tracks tree_cache state: absent | hot | invalidated | evicted.\n- Hot tree is retained for config.hot_tree_retention (30 minutes) after last parse.\n- Incremental changes with a hot tree and valid byte-edit info use incremental parse mode.\n- Incremental changes without a hot tree or without valid byte-edit info fall back to cold parse.\n- Never produce stale-tree correctness bugs.\n\n## Anti-goals\n\n- Do not try to persist syntax trees for the entire repo.\n- Do not risk stale-tree correctness bugs for marginal speedups.",
+      "acceptance": "- Repeated edits on hot files reindex faster than cold parse baseline (measured).\n- Cache misses fall back to cold parse safely — results are always correct.\n- Invalid or unavailable byte-edit information never causes stale-tree correctness bugs.\n- Syntax trees are not persisted for the whole repo — only hot files retain trees.\n- SourceFile tree_cache transitions are correct: absent → hot → invalidated → evicted.",
+      "context": "Allium rules: HotFilesPreferIncrementalReparse, IncrementalChangeFallsBackToColdParse, ParsedTasksBecomeWriteReadyAndRefreshHotTree. Config: hot_tree_retention = 30 minutes. Hotspots: parser/edit path, watcher-driven reindex path.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "shared-db-lifecycle",
+      "title": "Add shared-database lifecycle management, stale-root pruning, and maintenance stats",
+      "type": "task",
+      "priority": 1,
+      "parent": "qartez-mcp-latest-d6j",
+      "deps": ["blocked-by:db-split"],
+      "description": "Make shared --db-path usage visible and manageable: track root lifecycle metadata, support prune/stats/compact operations, and keep normal startup cheap.\n\n## Behavioural claims\n\n- DatabaseCatalog.mode can be dedicated or shared.\n- Shared projects become stale when missing on disk or inactive for config.stale_project_window (30 days).\n- Prune runs only during maintenance state and only prunes stale projects with no pending work.\n- Compact runs only when DatabasePolicy.compaction_due returns true.\n- Catalog returns to ready after maintenance completes.\n- Stats surface DB size, root counts, and maintenance timestamps.\n\n## Anti-goals\n\n- Do not vacuum/compact unexpectedly on normal startup.\n- Do not prune active roots or live data silently.",
+      "acceptance": "- Shared --db-path usage is visible to users via stats command.\n- Root lifecycle metadata is tracked (active, stale, pruned).\n- Stale roots can be pruned safely — only when they have no pending work.\n- Stats surface DB size, root counts, and maintenance timestamps.\n- Normal startup does not unexpectedly vacuum, compact, or prune.\n- Prune grace period (7 days) is respected before removing stale project data.\n- Compact runs only when policy says due, not on every startup.",
+      "context": "Allium rules: SharedProjectBecomesStaleWhenMissingOnDisk, SharedProjectBecomesStaleWhenInactive, PruneRunsOnlyDuringMaintenance, StaleProjectsArePrunedOnlyWhenIdle, OptimizeMayRunWhileCatalogIsReady, CompactRunsOnlyWhenPolicySaysDue, CatalogReturnsToReadyAfterMaintenance. Config: stale_project_window = 30 days, prune_grace_period = 7 days.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "rollout-regression-docs",
+      "title": "Finalize regression suite, benchmark report, and operator documentation",
+      "type": "task",
+      "priority": 2,
+      "parent": "qartez-mcp-latest-d6j",
+      "deps": ["blocked-by:watcher-parity-chunking", "blocked-by:parallel-full-index", "blocked-by:hot-incremental-reparse", "blocked-by:shared-db-lifecycle"],
+      "description": "Update rollout documentation, regression coverage, and handoff guidance after all implementation lanes have landed.\n\n## Scope\n\n- Ensure docs/agents guidance reflects implemented behaviour.\n- Update Allium spec for any observable behaviour changes not already covered.\n- Run full validation: cargo fmt --all -- --check, cargo clippy --all-targets --all-features -- -D warnings, cargo build --release, cargo test --release --no-fail-fast.\n- Run installer/bootstrap tests if those scripts were touched.\n- Produce benchmark report comparing before/after indexing performance.",
+      "acceptance": "- docs/agents guidance reflects implemented behaviour across all lanes.\n- Allium is updated for any observable behaviour changes.\n- Full validation passes: fmt, clippy, release build, release tests.\n- Installer/bootstrap changes run the relevant install tests.\n- Benchmark report documents performance improvements for each lane.\n- All discovered follow-up work is filed in Beads.",
+      "context": "Use docs/agents/validation-and-handoff.md as the closeout checklist. Allium contract: .allium/qartez-indexing-improvements.allium.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "bootstrap-bug",
+      "title": "Bootstrap fresh shared-server database should not fail on empty Dolt commit",
+      "type": "bug",
+      "priority": 0,
+      "parent": "qartez-mcp-latest-d6j",
+      "deps": ["discovered-from:qartez-mcp-latest-d6j"],
+      "description": "Fix the fresh shared-server bootstrap path that fails when Dolt has nothing to commit during initial database creation.\n\n## Reproduction\n\nOn Windows PowerShell:\n1. `bd bootstrap --dry-run` — plans to create fresh database\n2. `bd bootstrap` — fails with 'dolt commit: Error 1105: nothing to commit'\n3. `bd init --force` — succeeds but does not set up shared-server mode\n\n## Root cause hypothesis\n\nThe bootstrap flow attempts a `dolt commit` immediately after creating an empty database, but Dolt rejects the commit when there are no staged changes.\n\n## Fix approach\n\n- Detect empty initial state before attempting dolt commit.\n- Either skip the commit when there is no diff, or stage a minimal sentinel file to ensure there is always something to commit.\n- Add a regression test covering the empty fresh DB bootstrap path.",
+      "acceptance": "- Fresh shared-server bootstrap creates the project database successfully.\n- `bd ready` succeeds after bootstrap.\n- Bootstrap treats an empty initial Dolt commit as success or avoids committing when there is no diff.\n- Regression test covers the empty fresh DB bootstrap path.\n- Works on both Windows PowerShell and POSIX environments.",
+      "context": "Observed on Windows PowerShell with BEADS_DOLT_SHARED_SERVER=1 and BEADS_DOLT_SERVER_MODE=1. This is a discovered-from bug — it does not block the main roadmap but should be fixed to ensure reliable agent setup.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    }
+  ]
+}

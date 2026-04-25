@@ -1,0 +1,121 @@
+{
+  "issues": [
+    {
+      "key": "epic",
+      "title": "Epic: Qartez indexing/runtime improvements",
+      "type": "epic",
+      "priority": "P0",
+      "description": "Root coordination epic for the Qartez indexing/runtime improvement program.\n\nTracks implementation work derived from .allium/qartez-indexing-improvements.allium and docs/agents/*.md.",
+      "acceptance": "- Baseline acceptance/regression harness exists before major implementation work.\n- Readiness contract prevents silent empty results during cold start or maintenance.\n- Reader/writer DB split allows tool reads while indexing/watcher writes are active.\n- Parser workers are lazy-loaded and avoid a global parser bottleneck.\n- Full-index parse/extract can run in parallel without nondeterministic output drift.\n- Hot-file incremental reparsing is faster on repeated edits and safely falls back to cold parse.\n- Watcher and indexer use the same source-file eligibility policy.\n- Large watcher/write batches are chunked and bounded.\n- Shared DB lifecycle exposes stats, stale-root pruning, and explicit maintenance operations.\n- Full validation passes before rollout: fmt, clippy, release build, release tests.",
+      "context": "Behavioural contract: .allium/qartez-indexing-improvements.allium. Workflow docs: docs/agents/beads-workflow.md, docs/agents/allium-contract.md, docs/agents/high-roi-implementation-playbook.md, docs/agents/validation-and-handoff.md.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "baseline",
+      "title": "Baseline: acceptance harness for indexing/runtime behaviours",
+      "type": "task",
+      "priority": "P0",
+      "parent": "epic",
+      "description": "Add regression coverage for the Allium indexing/runtime behaviour contract before major implementation lanes begin.",
+      "acceptance": "- Cold-start readiness behaviour is tested.\n- Deterministic indexing output is tested.\n- Watcher/indexer eligibility parity is tested.\n- Writer chunk boundedness is tested.\n- Shared DB lifecycle metadata is testable.\n- Hot-file reparse fallback is tested.",
+      "context": "This is the first executable task. It turns the Allium contract into guardrails before changing runtime architecture.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "lane1",
+      "title": "Lane 1: Reader/writer DB split and readiness signalling",
+      "type": "task",
+      "priority": "P1",
+      "parent": "epic",
+      "deps": ["blocked-by:baseline"],
+      "description": "Implement explicit readiness states and reader/writer DB separation for indexing, watcher writes, maintenance, and tool reads.",
+      "acceptance": "- Cold-start query before index completion returns explicit deferred/not-ready status, not empty success.\n- Tool reads can proceed while writer activity is active when a usable index exists.\n- Indexing, watcher, prune, and compact use one controlled writer path.\n- Maintenance state is visible to callers.",
+      "context": "Primary hotspots: startup/index orchestration, server DB wiring, watcher/index writer path, tool-handler read path.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "lane2",
+      "title": "Lane 2: Thread-local lazy-loaded parser subsystem",
+      "type": "task",
+      "priority": "P1",
+      "parent": "epic",
+      "deps": ["blocked-by:baseline"],
+      "description": "Replace the global parser bottleneck with lazy per-language parser workers suitable for parallel indexing.",
+      "acceptance": "- Parser state is loaded lazily by language.\n- Rust-only repos do not pay meaningful startup cost for absent languages.\n- Parallel parse workers do not deadlock or serialize on one global parser lock.\n- Parser metrics or tests prove per-language lazy activation.",
+      "context": "Primary hotspots: src/index/parser.rs and parser call sites in src/index/mod.rs.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "lane3",
+      "title": "Lane 3: Parallel full-index parse/extract",
+      "type": "task",
+      "priority": "P1",
+      "parent": "epic",
+      "deps": ["blocked-by:baseline", "blocked-by:lane1", "blocked-by:lane2"],
+      "description": "Parallelize full-index parse/extract while keeping DB writes deterministic and serialized or batched.",
+      "acceptance": "- Full-index wall-clock time drops materially on representative repos.\n- Result sets remain stable across repeated runs.\n- DB writes are not performed directly from every worker.\n- Output ordering remains deterministic where downstream behaviour depends on it.",
+      "context": "Primary hotspot: src/index/mod.rs.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "lane4",
+      "title": "Lane 4: Hot-file incremental reparsing",
+      "type": "task",
+      "priority": "P1",
+      "parent": "epic",
+      "deps": ["blocked-by:lane2", "blocked-by:lane3"],
+      "description": "Reuse recent syntax tree state for watcher-driven edits and fall back safely to cold parse when reuse is unavailable.",
+      "acceptance": "- Repeated edits on hot files reindex faster than cold parse baseline.\n- Cache misses fall back to cold parse safely.\n- Invalid or unavailable byte-edit information never causes stale-tree correctness bugs.\n- Syntax trees are not persisted for the whole repo.",
+      "context": "Primary hotspots: parser/edit path and watcher-driven reindex path.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "lane5",
+      "title": "Lane 5: Shared DB lifecycle and pruning",
+      "type": "task",
+      "priority": "P1",
+      "parent": "epic",
+      "deps": ["blocked-by:lane1"],
+      "description": "Expose and manage shared database lifecycle state, stale roots, pruning, stats, and compaction.",
+      "acceptance": "- Shared --db-path usage is visible to users.\n- Root lifecycle metadata is tracked.\n- Stale roots can be pruned safely only when idle.\n- Stats surface DB size, root counts, and maintenance timestamps.\n- Normal startup does not unexpectedly vacuum, compact, or prune.",
+      "context": "Primary hotspots: DB schema/open path, CLI/admin surfacing, project/root metadata.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "lane6",
+      "title": "Lane 6: Watcher parity and chunked writes",
+      "type": "task",
+      "priority": "P1",
+      "parent": "epic",
+      "deps": ["blocked-by:lane1"],
+      "description": "Make watcher eligibility match indexer eligibility and split heavy watcher writes into bounded chunks.",
+      "acceptance": "- Watcher and indexer agree on supported files.\n- Special filenames stay fresh.\n- Write chunks remain at or below configured chunk size.\n- Branch switches or large watcher bursts do not monopolize the DB for long stretches.\n- Read latency remains bounded during large watcher bursts.",
+      "context": "Primary hotspots: src/watch.rs and supported-file logic shared with indexer.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "bootstrap-bug",
+      "title": "Bootstrap fresh shared-server database should not fail on empty Dolt commit",
+      "type": "bug",
+      "priority": "P0",
+      "parent": "epic",
+      "deps": ["discovered-from:epic"],
+      "description": "Fix the fresh shared-server bootstrap path that fails when Dolt has nothing to commit.",
+      "acceptance": "- Fresh shared-server bootstrap creates the project database.\n- bd ready succeeds after bootstrap.\n- Bootstrap treats an empty initial Dolt commit as success or avoids committing when there is no diff.\n- Regression test covers the empty fresh DB bootstrap path.",
+      "context": "Observed on Windows PowerShell: bd bootstrap --dry-run planned create fresh database qartez_mcp_latest; bd bootstrap failed with 'dolt commit: Error 1105: nothing to commit'; bd init --force succeeded.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    },
+    {
+      "key": "rollout",
+      "title": "Rollout: docs, regressions, and handoff protocol",
+      "type": "task",
+      "priority": "P2",
+      "parent": "epic",
+      "deps": ["blocked-by:lane3", "blocked-by:lane4", "blocked-by:lane5", "blocked-by:lane6"],
+      "description": "Update rollout documentation, regression coverage, and handoff guidance after implementation lanes land.",
+      "acceptance": "- docs/agents guidance reflects implemented behaviour.\n- Allium is updated for any observable behaviour changes.\n- Full validation passes: cargo fmt --all -- --check; cargo clippy --all-targets --all-features -- -D warnings; cargo build --release; cargo test --release --no-fail-fast.\n- Installer/bootstrap changes run the relevant install tests.",
+      "context": "Use docs/agents/validation-and-handoff.md as the closeout checklist.",
+      "spec_id": ".allium/qartez-indexing-improvements.allium"
+    }
+  ]
+}

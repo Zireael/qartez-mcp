@@ -1,0 +1,486 @@
+-- Qartez highest-ROI runtime and indexing improvements.
+-- Behavioural specification only. No Rust implementation details are prescribed here.
+
+config {
+    readiness_retry_after: Duration = 2.seconds
+    large_watch_batch_threshold: Integer = 200
+    writer_chunk_size: Integer = 50
+    stale_project_window: Duration = 30.days
+    prune_grace_period: Duration = 7.days
+    parser_idle_ttl: Duration = 15.minutes
+    hot_tree_retention: Duration = 30.minutes
+}
+
+deferred SupportedSourcePath.matches
+
+deferred ParserRuntime.worker_for
+
+deferred ProjectIndex.source_file_for
+
+deferred ChangeSet.has_byte_edit
+
+deferred Filesystem.exists
+
+deferred DatabasePolicy.compaction_due
+
+entity DatabaseCatalog {
+    path: String
+    mode: dedicated | shared
+    state: opening | ready | maintenance | degraded
+    reader_pool: warming | ready | degraded
+    writer_state: idle | full_indexing | incremental_indexing | pruning | compacting | blocked
+    last_opened_at: Timestamp?
+    last_optimized_at: Timestamp?
+    last_compacted_at: Timestamp?
+
+    projects: ProjectIndex with database_catalog = this
+    active_projects: projects where lifecycle = active
+    stale_projects: projects where lifecycle = stale
+}
+
+entity ProjectIndex {
+    database_catalog: DatabaseCatalog
+    root_path: String
+    lifecycle: active | stale | pruned
+    readiness: cold_start | indexing | ready | partial_reindex | maintenance | failed
+    last_accessed_at: Timestamp?
+    last_index_started_at: Timestamp?
+    last_index_completed_at: Timestamp?
+    last_pruned_at: Timestamp?
+
+    source_files: SourceFile with project_index = this
+    parse_workers: ParseWorker with project_index = this
+    parse_tasks: ParseTask with project_index = this
+    write_chunks: WriteChunk with project_index = this
+    watcher_batches: WatchBatch with project_index = this
+    query_sessions: QuerySession with project_index = this
+
+    pending_parse_tasks: parse_tasks where status in [queued, parsing, ready_to_write]
+    pending_write_chunks: write_chunks where status in [queued, committing]
+    active_watcher_batches: watcher_batches where status in [queued, preparing, parsing, writing]
+    has_pending_work: pending_parse_tasks.count + pending_write_chunks.count + active_watcher_batches.count > 0
+}
+
+entity SourceFile {
+    project_index: ProjectIndex
+    path: String
+    language: String
+    eligibility: supported | ignored | stale
+    tree_cache: absent | hot | invalidated | evicted
+    last_seen_at: Timestamp?
+    last_parsed_at: Timestamp?
+
+    parse_tasks: ParseTask with source_file = this
+
+    is_supported: SupportedSourcePath.matches(path)
+    has_hot_tree: tree_cache = hot and last_parsed_at != null and last_parsed_at + config.hot_tree_retention > now
+}
+
+entity ParseWorker {
+    project_index: ProjectIndex
+    thread_key: String
+    language: String
+    status: idle | loading_language | parsing | evicted
+    loaded_at: Timestamp?
+    last_used_at: Timestamp?
+
+    parse_tasks: ParseTask with worker = this
+}
+
+entity ParseTask {
+    project_index: ProjectIndex
+    source_file: SourceFile
+    worker: ParseWorker?
+    write_chunk: WriteChunk?
+    reason: cold_start | incremental_change | repair
+    parse_mode: cold | incremental
+    status: queued | parsing | ready_to_write | written | cancelled | failed
+    enqueued_at: Timestamp
+    completed_at: Timestamp?
+}
+
+entity WriteChunk {
+    project_index: ProjectIndex
+    sequence: Integer
+    status: queued | committing | committed | failed
+    created_at: Timestamp
+    committed_at: Timestamp?
+
+    parse_tasks: ParseTask with write_chunk = this
+    task_count: parse_tasks.count
+}
+
+entity QuerySession {
+    database_catalog: DatabaseCatalog
+    project_index: ProjectIndex
+    tool_name: String
+    status: waiting_for_readiness | served | deferred | rejected
+    completeness: complete | partial | none
+    retry_after: Duration?
+    received_at: Timestamp
+    served_at: Timestamp?
+}
+
+entity WatchBatch {
+    project_index: ProjectIndex
+    status: queued | preparing | parsing | writing | completed | failed
+    created_at: Timestamp
+    completed_at: Timestamp?
+
+    items: WatchItem with batch = this
+    supported_items: items where eligibility = supported
+}
+
+entity WatchItem {
+    batch: WatchBatch
+    file_path: String
+    kind: changed | created | deleted | renamed
+    exists_on_disk: Boolean
+    eligibility: supported | ignored
+}
+
+rule DatabaseCatalogOpens {
+    when: DatabaseOpened(path, mode)
+
+    ensures:
+        DatabaseCatalog.created(
+            path: path,
+            mode: mode,
+            state: opening,
+            reader_pool: warming,
+            writer_state: idle,
+            last_opened_at: now
+        )
+}
+
+rule ReaderPoolBecomesReadyBeforeQueriesAreServed {
+    when: database_catalog: DatabaseCatalog.created
+    requires: database_catalog.reader_pool = warming
+
+    ensures:
+        database_catalog.reader_pool = ready
+        if database_catalog.state = opening:
+            database_catalog.state = ready
+}
+
+rule ProjectOpenRegistersIndex {
+    when: ProjectOpened(database_catalog, root_path)
+
+    ensures:
+        ProjectIndex.created(
+            database_catalog: database_catalog,
+            root_path: root_path,
+            lifecycle: active,
+            readiness: cold_start,
+            last_accessed_at: now
+        )
+}
+
+rule InitialIndexMovesProjectIntoIndexing {
+    when: project_index: ProjectIndex.created
+    requires: project_index.readiness = cold_start
+
+    ensures:
+        project_index.readiness = indexing
+        project_index.last_index_started_at = now
+}
+
+rule ToolQueryCreatesSession {
+    when: ToolQueryReceived(project_index, tool_name)
+    requires: project_index.lifecycle = active
+
+    ensures:
+        project_index.last_accessed_at = now
+        QuerySession.created(
+            database_catalog: project_index.database_catalog,
+            project_index: project_index,
+            tool_name: tool_name,
+            status: waiting_for_readiness,
+            completeness: none,
+            received_at: now
+        )
+}
+
+rule QueryDefersUntilIndexIsUsable {
+    when: query_session: QuerySession.created
+    requires: query_session.project_index.readiness in [cold_start, indexing, maintenance]
+
+    ensures:
+        query_session.status = deferred
+        query_session.retry_after = config.readiness_retry_after
+}
+
+rule QueryServesFromReadyOrPartialIndex {
+    when: query_session: QuerySession.created
+    requires: query_session.project_index.readiness in [ready, partial_reindex]
+    requires: query_session.database_catalog.reader_pool = ready
+
+    ensures:
+        query_session.status = served
+        query_session.served_at = now
+        if query_session.project_index.readiness = partial_reindex:
+            query_session.completeness = partial
+        else:
+            query_session.completeness = complete
+}
+
+rule InitialIndexQueuesOnlySupportedFiles {
+    when: project_index.readiness = indexing
+
+    ensures:
+        for source_file in project_index.source_files:
+            if source_file.is_supported:
+                source_file.eligibility = supported
+                ParseTask.created(
+                    project_index: project_index,
+                    source_file: source_file,
+                    reason: cold_start,
+                    parse_mode: cold,
+                    status: queued,
+                    enqueued_at: now
+                )
+            else:
+                source_file.eligibility = ignored
+}
+
+rule WatcherUsesTheSameEligibilityPolicyAsTheIndexer {
+    when: watch_batch: WatchBatch.created
+    requires: watch_batch.status = queued
+
+    ensures:
+        watch_batch.status = preparing
+        for item in watch_batch.items:
+            if item.exists_on_disk and SupportedSourcePath.matches(item.file_path):
+                item.eligibility = supported
+            else if item.kind = deleted:
+                item.eligibility = supported
+            else:
+                item.eligibility = ignored
+}
+
+rule WatcherMovesReadyProjectsIntoPartialReindex {
+    when: watch_batch: WatchBatch.created
+    requires: watch_batch.project_index.readiness = ready
+
+    ensures:
+        watch_batch.project_index.readiness = partial_reindex
+}
+
+rule SupportedWatchItemsCreateIncrementalParseTasks {
+    when: watch_batch.status = preparing
+
+    ensures:
+        for item in watch_batch.supported_items:
+            if item.kind in [changed, created, renamed]:
+                ParseTask.created(
+                    project_index: watch_batch.project_index,
+                    source_file: ProjectIndex.source_file_for(watch_batch.project_index, item.file_path),
+                    reason: incremental_change,
+                    parse_mode: cold,
+                    status: queued,
+                    enqueued_at: now
+                )
+}
+
+rule ParseTaskClaimsThreadLocalWorkerForLanguage {
+    when: parse_task: ParseTask.created
+    requires: parse_task.status = queued
+
+    ensures:
+        parse_task.worker = ParserRuntime.worker_for(parse_task.project_index, parse_task.source_file.language)
+}
+
+rule WorkerLoadsLanguageOnDemand {
+    when: parse_task.worker != null
+    requires: parse_task.status = queued
+    requires: parse_task.worker.language = parse_task.source_file.language
+    requires: parse_task.worker.status in [idle, evicted]
+
+    ensures:
+        parse_task.worker.status = loading_language
+        parse_task.worker.loaded_at = now
+        parse_task.worker.last_used_at = now
+}
+
+rule IdleWorkerMayBeEvicted {
+    when: worker.last_used_at != null
+    requires: worker.status = idle
+    requires: now - worker.last_used_at >= config.parser_idle_ttl
+
+    ensures:
+        worker.status = evicted
+}
+
+rule HotFilesPreferIncrementalReparse {
+    when: parse_task.reason = incremental_change
+    requires: parse_task.source_file.has_hot_tree
+    requires: ChangeSet.has_byte_edit(parse_task.source_file.path)
+
+    ensures:
+        parse_task.parse_mode = incremental
+}
+
+rule IncrementalChangeFallsBackToColdParse {
+    when: parse_task.reason = incremental_change
+    requires: not parse_task.source_file.has_hot_tree or not ChangeSet.has_byte_edit(parse_task.source_file.path)
+
+    ensures:
+        parse_task.parse_mode = cold
+}
+
+rule ParsedTasksBecomeWriteReadyAndRefreshHotTree {
+    when: ParseFinished(parse_task)
+    requires: parse_task.status = parsing
+
+    ensures:
+        parse_task.status = ready_to_write
+        parse_task.completed_at = now
+        parse_task.source_file.last_parsed_at = now
+        parse_task.source_file.tree_cache = hot
+        parse_task.worker.status = idle
+        parse_task.worker.last_used_at = now
+}
+
+rule WriterCreatesBoundedChunks {
+    when: project_index.pending_parse_tasks.count > 0
+    requires: project_index.parse_tasks.any(task => task.status = ready_to_write and task.write_chunk = null)
+
+    ensures:
+        WriteChunk.created(
+            project_index: project_index,
+            sequence: project_index.write_chunks.count + 1,
+            status: queued,
+            created_at: now
+        )
+}
+
+rule ReadyTasksJoinChunksUntilSizeLimit {
+    when: write_chunk: WriteChunk.created
+
+    ensures:
+        for parse_task in write_chunk.project_index.parse_tasks:
+            if parse_task.status = ready_to_write and parse_task.write_chunk = null and write_chunk.task_count < config.writer_chunk_size:
+                parse_task.write_chunk = write_chunk
+}
+
+rule WriterCommitsEachChunkSeparately {
+    when: write_chunk.status = queued
+    requires: write_chunk.task_count > 0
+
+    ensures:
+        write_chunk.status = committing
+        write_chunk.project_index.database_catalog.writer_state = incremental_indexing
+}
+
+rule CommittedChunkYieldsToReaders {
+    when: ChunkCommitted(write_chunk)
+    requires: write_chunk.status = committing
+
+    ensures:
+        write_chunk.status = committed
+        write_chunk.committed_at = now
+        write_chunk.project_index.database_catalog.writer_state = idle
+        for parse_task in write_chunk.parse_tasks:
+            parse_task.status = written
+}
+
+rule ProjectReturnsToReadyWhenPendingWorkDrains {
+    when: project_index.has_pending_work = false
+    requires: project_index.readiness in [indexing, partial_reindex]
+
+    ensures:
+        project_index.readiness = ready
+        project_index.last_index_completed_at = now
+}
+
+rule SharedProjectBecomesStaleWhenMissingOnDisk {
+    when: project_index.database_catalog.mode = shared
+    requires: project_index.lifecycle = active
+    requires: not Filesystem.exists(project_index.root_path)
+
+    ensures:
+        project_index.lifecycle = stale
+}
+
+rule SharedProjectBecomesStaleWhenInactive {
+    when: project_index.database_catalog.mode = shared
+    requires: project_index.lifecycle = active
+    requires: project_index.last_accessed_at != null
+    requires: now - project_index.last_accessed_at >= config.stale_project_window
+
+    ensures:
+        project_index.lifecycle = stale
+}
+
+rule PruneRunsOnlyDuringMaintenance {
+    when: PruneRequested(database_catalog)
+    requires: database_catalog.mode = shared
+    requires: database_catalog.state = ready
+
+    ensures:
+        database_catalog.state = maintenance
+        database_catalog.writer_state = pruning
+}
+
+rule StaleProjectsArePrunedOnlyWhenIdle {
+    when: database_catalog.state = maintenance
+    requires: database_catalog.writer_state = pruning
+
+    ensures:
+        for project_index in database_catalog.stale_projects:
+            if not project_index.has_pending_work:
+                project_index.lifecycle = pruned
+                project_index.last_pruned_at = now
+}
+
+rule OptimizeMayRunWhileCatalogIsReady {
+    when: OptimizeRequested(database_catalog)
+    requires: database_catalog.state = ready
+
+    ensures:
+        database_catalog.last_optimized_at = now
+}
+
+rule CompactRunsOnlyWhenPolicySaysDue {
+    when: CompactRequested(database_catalog)
+    requires: database_catalog.state = ready
+    requires: DatabasePolicy.compaction_due(database_catalog)
+
+    ensures:
+        database_catalog.state = maintenance
+        database_catalog.writer_state = compacting
+}
+
+rule CatalogReturnsToReadyAfterMaintenance {
+    when: MaintenanceCompleted(database_catalog)
+    requires: database_catalog.state = maintenance
+
+    ensures:
+        database_catalog.state = ready
+        database_catalog.writer_state = idle
+}
+
+invariant QueriesAreOnlyServedFromUsableIndexes {
+    for query_session in QuerySessions:
+        query_session.status = served implies query_session.project_index.readiness in [ready, partial_reindex]
+}
+
+invariant UnsupportedFilesNeverProduceParseTasks {
+    for parse_task in ParseTasks:
+        parse_task.source_file.eligibility != ignored
+}
+
+invariant IncrementalTasksAreAlwaysClassified {
+    for parse_task in ParseTasks:
+        parse_task.reason = incremental_change implies parse_task.parse_mode in [cold, incremental]
+}
+
+invariant ChunksRemainBounded {
+    for write_chunk in WriteChunks:
+        write_chunk.task_count <= config.writer_chunk_size
+}
+
+invariant PrunedProjectsHaveNoPendingWork {
+    for project_index in ProjectIndexes:
+        project_index.lifecycle = pruned implies not project_index.has_pending_work
+}
