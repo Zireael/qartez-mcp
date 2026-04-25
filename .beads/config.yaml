@@ -54,3 +54,7 @@
 # - github.repo
 
 dolt.shared-server: true
+dolt:
+  server_mode: true
+  server_host: "127.0.0.1"
+  server_port: 55801

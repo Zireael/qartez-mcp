@@ -2,6 +2,7 @@
   "database": "dolt",
   "backend": "dolt",
   "dolt_mode": "server",
+  "dolt_server_port": 55801,
   "dolt_database": "qartez_mcp_latest",
   "project_id": "53f8e96d-452d-4102-8fbd-c8b225da8266",
   "global_dolt_database": "beads_global"
