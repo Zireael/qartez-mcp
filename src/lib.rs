@@ -14,6 +14,9 @@ pub(crate) mod test_paths;
 pub mod toolchain;
 pub mod watch;
 
+#[cfg(test)]
+mod acceptance;
+
 #[cfg(feature = "benchmark")]
 pub mod benchmark;
 
