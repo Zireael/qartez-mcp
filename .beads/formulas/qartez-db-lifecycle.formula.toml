@@ -1,0 +1,26 @@
+description = "Implement Qartez shared-database lifecycle management and pruning"
+formula = "qartez-db-lifecycle"
+version = 1
+
+[[steps]]
+id = "project-registry"
+title = "Add per-root/project registry metadata"
+description = "Track root path, lifecycle state, last index time, and last access time for shared databases."
+
+[[steps]]
+id = "stats-surface"
+title = "Expose DB stats and maintenance visibility"
+description = "Add stats for DB size, root counts, stale roots, and maintenance timestamps."
+needs = ["project-registry"]
+
+[[steps]]
+id = "prune-stale"
+title = "Prune deleted or stale roots safely"
+description = "Only prune roots that are idle and have no pending work."
+needs = ["project-registry"]
+
+[[steps]]
+id = "compact-policy"
+title = "Add explicit optimize and compact policy"
+description = "Avoid surprise compaction on normal startup and make maintenance actions explicit."
+needs = ["stats-surface", "prune-stale"]

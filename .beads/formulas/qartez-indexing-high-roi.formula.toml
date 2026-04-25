@@ -1,0 +1,66 @@
+description = "Implement the highest-ROI Qartez indexing/runtime improvements from the Allium spec"
+formula = "qartez-indexing-high-roi"
+version = 1
+
+[vars.repo]
+description = "Repository under work"
+required = false
+default = "kuberstar/qartez-mcp"
+
+[vars.spec_file]
+description = "Allium behavioural spec file"
+required = false
+default = "allium/qartez-indexing-improvements.allium"
+
+[[steps]]
+id = "baseline-harness"
+title = "Capture baseline metrics and acceptance harness"
+description = "Measure cold-start latency, full-index wall-clock time, watcher reindex latency, read latency under writer pressure, and shared-DB growth. Add deterministic regression coverage for readiness states, watcher parity, chunked writer behaviour, and parser hot-file reuse."
+
+[[steps]]
+id = "readiness-contract"
+title = "Add explicit readiness signalling and partial-result contract"
+description = "Introduce explicit project readiness states and remove silent empty results during cold start or maintenance."
+needs = ["baseline-harness"]
+
+[[steps]]
+id = "db-split"
+title = "Split SQLite access into dedicated writer path plus read pool"
+description = "Reserve indexing, watcher, prune, and compaction work for a writer path and move query serving onto reader connections."
+needs = ["baseline-harness", "readiness-contract"]
+
+[[steps]]
+id = "watcher-parity-chunking"
+title = "Unify watcher eligibility with indexer logic and chunk writes"
+description = "Route watcher file support through the same supported-source logic as the indexer and commit large watcher batches in bounded chunks."
+needs = ["db-split"]
+
+[[steps]]
+id = "parser-workers"
+title = "Replace mutexed parser with thread-local, lazy-loaded parser workers"
+description = "Create thread-local parser workers and lazy-load per-language state only when that language appears in the repo."
+needs = ["baseline-harness"]
+
+[[steps]]
+id = "parallel-full-index"
+title = "Parallelize full-index parse and extract"
+description = "Run file parse/extract work in parallel while keeping DB writes deterministic and serialized or batched."
+needs = ["parser-workers"]
+
+[[steps]]
+id = "hot-incremental-reparse"
+title = "Add hot-file incremental reparsing"
+description = "Cache recent Tree state and use incremental reparsing on watcher-driven edits when edit ranges are known."
+needs = ["parser-workers"]
+
+[[steps]]
+id = "shared-db-lifecycle"
+title = "Add shared-DB lifecycle management, pruning, and maintenance entry points"
+description = "Track project/root lifecycle, expose stats, and safely prune stale roots or compact shared DBs without surprising normal cold start."
+needs = ["db-split"]
+
+[[steps]]
+id = "rollout-regression-docs"
+title = "Finalize regression suite, benchmark report, and operator docs"
+description = "Lock in benchmarks, acceptance tests, rollout notes, and documentation aligned with the Allium behaviour model."
+needs = ["watcher-parity-chunking", "parallel-full-index", "hot-incremental-reparse", "shared-db-lifecycle"]

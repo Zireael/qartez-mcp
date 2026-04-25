@@ -1,0 +1,26 @@
+description = "Implement the Qartez DB split, readiness contract, and watcher fairness work"
+formula = "qartez-db-readiness"
+version = 1
+
+[[steps]]
+id = "readiness-contract"
+title = "Define readiness states and partial-result semantics"
+description = "Make cold start and maintenance states explicit and observable to tool callers."
+
+[[steps]]
+id = "db-split"
+title = "Split writer and reader DB paths"
+description = "Isolate indexing/watcher/prune work from read-serving tool handlers."
+needs = ["readiness-contract"]
+
+[[steps]]
+id = "watcher-parity-chunking"
+title = "Make watcher writes fair and file-support logic consistent"
+description = "Chunk watcher writes and use the same file-support rule as the indexer."
+needs = ["db-split"]
+
+[[steps]]
+id = "shared-db-lifecycle"
+title = "Add shared-DB stats, prune, and compact workflows"
+description = "Track stale roots and bound long-term DB growth for shared --db-path usage."
+needs = ["db-split"]

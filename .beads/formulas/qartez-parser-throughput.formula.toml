@@ -1,0 +1,20 @@
+description = "Implement the Qartez parser throughput improvements"
+formula = "qartez-parser-throughput"
+version = 1
+
+[[steps]]
+id = "parser-workers"
+title = "Replace mutexed parser with thread-local lazy workers"
+description = "Stop serializing parse work on one parser instance and only load language state when needed."
+
+[[steps]]
+id = "parallel-full-index"
+title = "Parallelize full-index parse/extract"
+description = "Move the heavy parse/extract stage to parallel workers while keeping writes deterministic."
+needs = ["parser-workers"]
+
+[[steps]]
+id = "hot-incremental-reparse"
+title = "Use incremental reparsing for hot files"
+description = "Reuse old Tree state for watcher-driven edits where edit ranges are available."
+needs = ["parser-workers"]

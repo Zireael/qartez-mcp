@@ -1,0 +1,87 @@
+{
+  "plan": {
+    "name": "Qartez highest-ROI indexing improvements",
+    "repo": "kuberstar/qartez-mcp",
+    "spec_file": "allium/qartez-indexing-improvements.allium",
+    "recommended_branch": "feat/indexing-high-roi"
+  },
+  "issues": [
+    {
+      "key": "baseline-harness",
+      "title": "Capture baseline metrics and add acceptance harness",
+      "priority": 0,
+      "type": "task",
+      "description": "Measure cold-start latency, full-index wall-clock time, watcher-triggered reindex latency, query latency during writer pressure, and shared-DB growth. Add deterministic regression coverage for readiness states, watcher file parity, chunked writer behaviour, and parser hot-file reuse. Source hotspots: src/main.rs, src/index/mod.rs, src/watch.rs, src/storage/schema.rs."
+    },
+    {
+      "key": "readiness-contract",
+      "title": "Add explicit readiness signalling and partial-result contract",
+      "priority": 0,
+      "type": "task",
+      "description": "Introduce explicit project readiness states for cold start, indexing, ready, partial reindex, maintenance, and failed. Ensure tool handlers never return silent empty results when the index is not yet usable. Return explicit retry/deferred semantics instead. Primary hotspots: src/main.rs, src/server/mod.rs, startup/index orchestration."
+    },
+    {
+      "key": "db-split",
+      "title": "Split SQLite access into dedicated writer path plus read pool",
+      "priority": 0,
+      "type": "task",
+      "description": "Reserve a dedicated writer connection for indexing, watcher work, pruning, and compaction. Move query-serving tool handlers to read-only pooled connections. Keep WAL semantics healthy and ensure reader latency stays stable while the writer is active. Primary hotspots: storage open path, server DB wiring, watcher/indexer orchestration."
+    },
+    {
+      "key": "watcher-parity-chunking",
+      "title": "Unify watcher eligibility with indexer logic and chunk writer commits",
+      "priority": 1,
+      "type": "task",
+      "description": "Route watcher file eligibility through the same supported-source logic used by the indexer so special files stay fresh. Chunk large watcher writes into bounded transactions and yield between chunks so reads are not starved during branch switches or mass renames. Primary hotspots: src/watch.rs, src/index/mod.rs."
+    },
+    {
+      "key": "parser-workers",
+      "title": "Replace mutexed parser with thread-local, lazy-loaded parser workers",
+      "priority": 0,
+      "type": "task",
+      "description": "Replace the single Mutex<Parser> model with thread-local parser workers. Lazy-load parser/language state on first use so Rust-only repositories do not pay meaningful startup cost for Python, Dart, or Go parser setup. Primary hotspots: src/index/parser.rs and parser call sites in src/index/mod.rs."
+    },
+    {
+      "key": "parallel-full-index",
+      "title": "Parallelize full-index parse and extract while keeping DB writes serialized",
+      "priority": 1,
+      "type": "task",
+      "description": "Refactor full_index_root into pipeline phases: file discovery, file read, parse/extract in parallel, then serialized/batched DB writes. Preserve deterministic output ordering even under parallel parse execution. Primary hotspot: src/index/mod.rs."
+    },
+    {
+      "key": "hot-incremental-reparse",
+      "title": "Add hot-file incremental reparsing using cached Tree state",
+      "priority": 1,
+      "type": "task",
+      "description": "Cache previous Tree state for recently changed files and reparse with old-tree reuse on watcher-driven edits when byte-edit hints are available. Fall back cleanly to cold parse when cache/edit information is missing or invalid. Primary hotspots: src/index/parser.rs, src/index/mod.rs, watcher edit path."
+    },
+    {
+      "key": "shared-db-lifecycle",
+      "title": "Add shared-database lifecycle management, stale-root pruning, and maintenance stats",
+      "priority": 1,
+      "type": "task",
+      "description": "Track per-project/root metadata, last access, and lifecycle state for shared databases used via --db-path. Add db stats, prune, and compact entry points. Prune deleted or stale roots safely and avoid surprise maintenance work on normal cold start. Primary hotspots: src/storage/schema.rs, DB open path, CLI/admin surfaces."
+    },
+    {
+      "key": "rollout-regression-docs",
+      "title": "Finalize regression suite, benchmark report, and operator documentation",
+      "priority": 2,
+      "type": "task",
+      "description": "Lock in acceptance tests, before/after benchmark results, rollout notes, and operator docs for readiness, parser worker lifecycle, watcher chunking, and shared-DB maintenance. Ensure the Allium spec and implementation docs stay aligned."
+    }
+  ],
+  "dependencies": [
+    ["readiness-contract", "baseline-harness"],
+    ["db-split", "baseline-harness"],
+    ["db-split", "readiness-contract"],
+    ["watcher-parity-chunking", "db-split"],
+    ["parser-workers", "baseline-harness"],
+    ["parallel-full-index", "parser-workers"],
+    ["hot-incremental-reparse", "parser-workers"],
+    ["shared-db-lifecycle", "db-split"],
+    ["rollout-regression-docs", "watcher-parity-chunking"],
+    ["rollout-regression-docs", "parallel-full-index"],
+    ["rollout-regression-docs", "hot-incremental-reparse"],
+    ["rollout-regression-docs", "shared-db-lifecycle"]
+  ]
+}
