@@ -34,6 +34,7 @@ use rusqlite::Connection;
 
 use crate::graph::blast;
 use crate::guard;
+use crate::readiness::ReadinessState;
 use crate::storage::read;
 use crate::storage::read::sanitize_fts_query;
 use crate::toolchain;
@@ -434,6 +435,31 @@ macro_rules! dispatch_tool_call {
 }
 
 impl QartezServer {
+    /// Check the current readiness state by reading from the database.
+    fn current_readiness(&self) -> std::result::Result<Option<ReadinessState>, String> {
+        let conn = self
+            .db
+            .lock()
+            .map_err(|e| format!("db lock poisoned: {e}"))?;
+        crate::storage::read::get_readiness(&conn)
+            .map_err(|e| format!("failed to read readiness: {e}"))
+    }
+
+    /// Build a deferred response JSON for when queries cannot be served.
+    ///
+    /// Per Allium `QueryDefersUntilIndexIsUsable`: returns a structured
+    /// response with `status`, `readiness`, `retry_after`, and a human-
+    /// readable `message`.
+    fn build_deferred_response(&self, state: ReadinessState) -> String {
+        serde_json::json!({
+            "status": "deferred",
+            "readiness": state,
+            "retry_after": state.retry_after_secs(),
+            "message": format!("Index not ready: {}. Retry after {} seconds.", state, state.retry_after_secs()),
+        })
+        .to_string()
+    }
+
     /// Dispatch a tool call by name with JSON arguments.
     ///
     /// Provides a single in-process entry point so the CLI and benchmark
@@ -449,6 +475,65 @@ impl QartezServer {
         } else {
             args
         };
+
+        // Check readiness before dispatching query tools.
+        // Per Allium: QueryDefersUntilIndexIsUsable
+        let query_tools = [
+            "qartez_map",
+            "qartez_find",
+            "qartez_read",
+            "qartez_grep",
+            "qartez_refs",
+            "qartez_calls",
+            "qartez_deps",
+            "qartez_impact",
+            "qartez_diff_impact",
+            "qartez_cochange",
+            "qartez_unused",
+            "qartez_outline",
+            "qartez_stats",
+            "qartez_context",
+            "qartez_wiki",
+            "qartez_hotspots",
+            "qartez_clones",
+            "qartez_smells",
+            "qartez_health",
+            "qartez_refactor_plan",
+            "qartez_test_gaps",
+            "qartez_boundaries",
+            "qartez_hierarchy",
+            "qartez_trend",
+            "qartez_security",
+            "qartez_semantic",
+            "qartez_knowledge",
+            "qartez_rename",
+            "qartez_move",
+            "qartez_rename_file",
+            "qartez_replace_symbol",
+            "qartez_insert_before_symbol",
+            "qartez_insert_after_symbol",
+            "qartez_safe_delete",
+        ];
+
+        if query_tools.contains(&name) {
+            match self.current_readiness() {
+                Ok(Some(state)) if state.should_defer() => {
+                    return Ok(self.build_deferred_response(state));
+                }
+                Ok(Some(_)) => {
+                    // Ready or PartialReindex — proceed with query
+                }
+                Ok(None) => {
+                    // No readiness key set yet (pre-existing DB or first start
+                    // before main.rs sets ColdStart). Treat as deferred.
+                    return Ok(self.build_deferred_response(ReadinessState::ColdStart));
+                }
+                Err(e) => {
+                    return Err(format!("readiness check failed: {e}"));
+                }
+            }
+        }
+
         dispatch_tool_call!(self, name, args,
             infallible {
             }
@@ -649,6 +734,10 @@ mod progressive_tests {
     fn test_server() -> QartezServer {
         let conn = Connection::open_in_memory().unwrap();
         crate::storage::schema::create_schema(&conn).unwrap();
+        // Set readiness to Ready so tests don't get deferred responses.
+        // Tests that verify readiness gating set it explicitly.
+        crate::storage::write::set_readiness(&conn, crate::readiness::ReadinessState::Ready)
+            .unwrap();
         QartezServer::new(conn, std::path::PathBuf::from("/tmp/test"), 0)
     }
 
@@ -831,6 +920,8 @@ mod safe_resolve_tests {
     fn dummy_server(root: &std::path::Path) -> QartezServer {
         let conn = Connection::open_in_memory().unwrap();
         crate::storage::schema::create_schema(&conn).unwrap();
+        crate::storage::write::set_readiness(&conn, crate::readiness::ReadinessState::Ready)
+            .unwrap();
         QartezServer::new(conn, root.to_path_buf(), 0)
     }
 

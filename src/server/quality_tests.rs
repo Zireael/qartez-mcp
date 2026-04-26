@@ -23,6 +23,8 @@ fn setup_db() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
     schema::create_schema(&conn).unwrap();
+    // Set readiness to Ready so tests don't get deferred responses.
+    crate::storage::write::set_readiness(&conn, crate::readiness::ReadinessState::Ready).unwrap();
     conn
 }
 

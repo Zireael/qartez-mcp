@@ -965,3 +965,167 @@ fn schema_foreign_keys_are_enforced() {
     // Verify FK integrity explicitly
     crate::storage::verify_foreign_keys(&conn).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Readiness signalling acceptance tests
+// ---------------------------------------------------------------------------
+
+/// Maps to **Rule: QueryDefersUntilIndexIsUsable**
+///
+/// When readiness is ColdStart (or no readiness key set), query tools
+/// must return a deferred response with `retry_after` rather than an
+/// error or empty results.
+#[test]
+fn rule_query_deferred_when_cold_start() {
+    use crate::server::QartezServer;
+
+    let conn = test_db();
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+
+    // Create server without setting readiness — simulates cold start
+    let server = QartezServer::new(conn, root.clone(), 10);
+
+    // Query should be deferred
+    let result = server.call_tool_by_name("qartez_map", serde_json::json!({}));
+
+    // Should return Ok with deferred status, not an error
+    assert!(
+        result.is_ok(),
+        "query should return Ok with deferred status"
+    );
+    let response = result.unwrap();
+    assert!(
+        response.contains("deferred"),
+        "response should indicate deferral: {response}"
+    );
+    assert!(
+        response.contains("retry_after"),
+        "response should include retry_after: {response}"
+    );
+}
+
+/// Maps to **Rule: QueryDefersUntilIndexIsUsable**
+///
+/// When readiness is explicitly set to Indexing, query tools
+/// must return a deferred response.
+#[test]
+fn rule_query_deferred_when_indexing() {
+    use crate::server::QartezServer;
+
+    let conn = test_db();
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+
+    // Set readiness to Indexing
+    write::set_readiness(&conn, crate::readiness::ReadinessState::Indexing).unwrap();
+
+    let server = QartezServer::new(conn, root.clone(), 10);
+
+    let result = server.call_tool_by_name("qartez_find", serde_json::json!({"name": "foo"}));
+
+    assert!(
+        result.is_ok(),
+        "query should return Ok with deferred status"
+    );
+    let response = result.unwrap();
+    assert!(
+        response.contains("deferred"),
+        "response should indicate deferral: {response}"
+    );
+    assert!(
+        response.contains("indexing"),
+        "response should mention indexing state: {response}"
+    );
+}
+
+/// Maps to **Rule: QueryServesFromReadyOrPartialIndex**
+///
+/// When readiness is Ready, query tools should proceed normally
+/// (not deferred).
+#[test]
+fn rule_query_served_when_ready() {
+    use crate::server::QartezServer;
+
+    let conn = test_db();
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+
+    // Set readiness to Ready
+    write::set_readiness(&conn, crate::readiness::ReadinessState::Ready).unwrap();
+
+    let server = QartezServer::new(conn, root.clone(), 10);
+
+    // qartez_map on an empty but Ready DB should return empty results,
+    // not a deferred response
+    let result = server.call_tool_by_name("qartez_map", serde_json::json!({}));
+
+    assert!(result.is_ok(), "query should succeed when Ready");
+    let response = result.unwrap();
+    assert!(
+        !response.contains("deferred"),
+        "Ready state should not defer queries: {response}"
+    );
+}
+
+/// Maps to **Rule: QueryServesFromReadyOrPartialIndex**
+///
+/// When readiness is PartialReindex, query tools should still proceed
+/// (the index is usable during incremental reindex).
+#[test]
+fn rule_query_served_when_partial_reindex() {
+    use crate::server::QartezServer;
+
+    let conn = test_db();
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+
+    // Set readiness to PartialReindex
+    write::set_readiness(&conn, crate::readiness::ReadinessState::PartialReindex).unwrap();
+
+    let server = QartezServer::new(conn, root.clone(), 10);
+
+    let result = server.call_tool_by_name("qartez_map", serde_json::json!({}));
+
+    assert!(result.is_ok(), "query should succeed when PartialReindex");
+    let response = result.unwrap();
+    assert!(
+        !response.contains("deferred"),
+        "PartialReindex state should not defer queries: {response}"
+    );
+}
+
+/// Meta-tools (qartez_project, qartez_workspace) should NOT be deferred
+/// even when readiness is ColdStart — they don't depend on index data.
+/// They may still return errors for other reasons (e.g. no toolchain found),
+/// but the error must NOT contain "deferred".
+#[test]
+fn rule_meta_tools_not_deferred_when_cold_start() {
+    use crate::server::QartezServer;
+
+    let conn = test_db();
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+
+    // No readiness set — cold start
+    let server = QartezServer::new(conn, root.clone(), 10);
+
+    let result = server.call_tool_by_name("qartez_project", serde_json::json!({}));
+
+    // The tool may return Err (e.g. no toolchain found) or Ok —
+    // but it must NOT be a deferred readiness response.
+    match &result {
+        Ok(response) => {
+            assert!(
+                !response.contains("deferred"),
+                "meta tools should not be deferred: {response}"
+            );
+        }
+        Err(e) => {
+            assert!(
+                !e.contains("deferred"),
+                "meta tools should not return deferred error: {e}"
+            );
+        }
+    }
+}

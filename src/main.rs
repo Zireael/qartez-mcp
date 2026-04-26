@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use clap::{CommandFactory, Parser};
-use qartez_mcp::{cli, cli_runner, config, git, graph, index, lock, server, storage};
+use qartez_mcp::{cli, cli_runner, config, git, graph, index, lock, readiness, server, storage, watch};
 use rmcp::ServiceExt;
 
 #[tokio::main]
@@ -41,6 +41,12 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let conn = storage::open_db(&config.db_path)?;
+
+    // Set initial readiness state. Update in steps:
+    // 1. ColdStart: DB opened, about to check has_project
+    // 2. Indexing: before spawn_blocking (if has project)
+    // 3. Ready: after background indexing completes
+    storage::write::set_readiness(&conn, readiness::ReadinessState::ColdStart)?;
 
     tracing::info!("Database ready at {}", config.db_path.display());
 
@@ -154,6 +160,8 @@ async fn main() -> anyhow::Result<()> {
                     "workspace fingerprint matches; skipping full reindex (use --reindex to force)"
                 );
             }
+            // Set Indexing state before spawning background task
+            storage::write::set_readiness(&conn, readiness::ReadinessState::Indexing)?;
             tokio::task::spawn_blocking(move || {
                 // Acquire the cross-process lock first so a sibling qartez
                 // process indexing the same repo cannot race against our
@@ -248,6 +256,10 @@ async fn main() -> anyhow::Result<()> {
                     "Background index complete for {} root(s)",
                     project_roots.len()
                 );
+                // Set Ready state after indexing completes successfully.
+                // Note: this uses the SAME db_path, so the running server's
+                // next query will see the updated state.
+                let _ = storage::write::set_readiness(&conn, readiness::ReadinessState::Ready);
             });
         }
     } else {

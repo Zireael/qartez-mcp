@@ -447,6 +447,11 @@ pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Write the current readiness state to the meta table.
+pub fn set_readiness(conn: &Connection, state: crate::readiness::ReadinessState) -> Result<()> {
+    set_meta(conn, "readiness", &state.to_string())
+}
+
 pub fn clear_file_clusters(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM file_clusters", [])?;
     Ok(())

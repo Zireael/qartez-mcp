@@ -834,6 +834,16 @@ pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(result)
 }
 
+/// Read the current readiness state from the meta table.
+///
+/// Returns `None` when no readiness key has been set yet (first start).
+pub fn get_readiness(conn: &Connection) -> Result<Option<crate::readiness::ReadinessState>> {
+    let raw = get_meta(conn, "readiness")?;
+    Ok(raw
+        .as_deref()
+        .and_then(crate::readiness::ReadinessState::from_meta))
+}
+
 #[allow(dead_code)]
 pub fn get_stale_files(conn: &Connection) -> Result<Vec<FileRow>> {
     let mut stmt = conn.prepare(
@@ -1713,6 +1723,26 @@ mod tests {
 
         let missing = get_meta(&conn, "nonexistent").unwrap();
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_get_readiness_roundtrip() {
+        let conn = setup();
+        // No readiness set yet → None
+        assert!(get_readiness(&conn).unwrap().is_none());
+
+        // Set each state and read it back
+        for state in [
+            crate::readiness::ReadinessState::ColdStart,
+            crate::readiness::ReadinessState::Indexing,
+            crate::readiness::ReadinessState::Ready,
+            crate::readiness::ReadinessState::PartialReindex,
+            crate::readiness::ReadinessState::Maintenance,
+            crate::readiness::ReadinessState::Failed,
+        ] {
+            write::set_readiness(&conn, state).unwrap();
+            assert_eq!(get_readiness(&conn).unwrap(), Some(state));
+        }
     }
 
     #[test]
