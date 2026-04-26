@@ -1,6 +1,8 @@
 use rusqlite::Connection;
 
 use crate::error::Result;
+use crate::readiness::{ReadinessState, WriterState};
+use crate::storage::write;
 
 const CREATE_FILES: &str = "
 CREATE TABLE IF NOT EXISTS files (
@@ -205,6 +207,10 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
         ]
         .join(";\n"),
     )?;
+
+    // Initialize default readiness state for empty index
+    write::set_meta(conn, "readiness", &ReadinessState::Ready.to_string())?;
+    write::set_meta(conn, "writer_state", &WriterState::Idle.to_string())?;
 
     Ok(())
 }

@@ -1,6 +1,7 @@
 pub mod fingerprint;
 pub mod languages;
 pub mod parser;
+pub mod parser_workers;
 pub mod symbols;
 pub mod walker;
 
@@ -10,6 +11,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use crate::error::Result;
+use crate::readiness::{ReadinessState, WriterState};
 use crate::storage::models::SymbolInsert;
 use crate::storage::read;
 use crate::storage::write;
@@ -617,6 +619,11 @@ pub fn full_index_root(
     }
 
     tracing::info!("indexing complete: {updated} updated, {skipped} skipped, {deleted} deleted");
+
+    // Mark index as ready after full indexing completes
+    write::set_meta(conn, "readiness", &ReadinessState::Ready.to_string())?;
+    write::set_meta(conn, "writer_state", &WriterState::Idle.to_string())?;
+
     Ok(())
 }
 
