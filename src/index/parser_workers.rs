@@ -88,10 +88,12 @@ impl ParseWorker {
             })?;
 
         let lang = support.tree_sitter_language(ext);
-        self.parser.set_language(&lang).map_err(|e| QartezError::Parse {
-            path: "".to_string(),
-            message: format!("failed to set language: {}", e),
-        })?;
+        self.parser
+            .set_language(&lang)
+            .map_err(|e| QartezError::Parse {
+                path: "".to_string(),
+                message: format!("failed to set language: {}", e),
+            })?;
 
         self.state = WorkerState::Idle;
         Ok(())
@@ -145,9 +147,10 @@ impl ParserWorkers {
     /// Get or create a worker for the given file extension
     pub fn worker_for(&mut self, ext: &str) -> Result<&mut ParseWorker> {
         // Get or create worker for this language
-        let worker = self.workers.entry(ext.to_string()).or_insert_with(|| {
-            ParseWorker::new(ext)
-        });
+        let worker = self
+            .workers
+            .entry(ext.to_string())
+            .or_insert_with(|| ParseWorker::new(ext));
 
         // Ensure language is loaded (lazy initialization)
         worker.ensure_language(ext)?;
@@ -184,13 +187,19 @@ impl ParserWorkers {
             return Err(QartezError::Parse {
                 path: path.display().to_string(),
                 message: format!("unsupported file: {}", filename),
-            }.into());
+            }
+            .into());
         }
 
         self.parse_with_key(path, source, &lang_ext)
     }
 
-    fn parse_with_key(&mut self, path: &Path, source: &[u8], lang_ext: &str) -> Result<(ParseResult, String)> {
+    fn parse_with_key(
+        &mut self,
+        path: &Path,
+        source: &[u8],
+        lang_ext: &str,
+    ) -> Result<(ParseResult, String)> {
         // Get or create worker for this language
         let worker = self.worker_for(lang_ext)?;
 

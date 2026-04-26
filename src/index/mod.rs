@@ -5,8 +5,11 @@ pub mod parser_workers;
 pub mod symbols;
 pub mod walker;
 
+use rayon::prelude::*;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rusqlite::Connection;
 
@@ -46,6 +49,103 @@ fn max_file_bytes() -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1_000_000) // 1 MB default
+}
+
+/// Intermediate result from parallel parse phase, before serial DB writes.
+/// Holds everything needed to write to DB in the second phase.
+struct ParsedFile {
+    file_path: PathBuf,
+    raw_rel: String,
+    rel_path: String,
+    mtime_ns: i64,
+    size_bytes: i64,
+    source: Vec<u8>,
+    parse_result: symbols::ParseResult,
+    language: String,
+}
+
+/// Parallel parse using rayon - each thread gets its own parser.
+/// Returns parsed results ready for serial DB writes.
+fn parallel_parse_files(
+    files: &[PathBuf],
+    root: &Path,
+    path_prefix: &str,
+    max_bytes: u64,
+) -> Vec<ParsedFile> {
+    files
+        .par_iter()
+        .filter_map(|file_path| {
+            let metadata = match std::fs::metadata(file_path) {
+                Ok(m) => m,
+                Err(_) => return None,
+            };
+
+            if metadata.len() > max_bytes {
+                return None;
+            }
+
+            let raw_rel = match file_path.strip_prefix(root) {
+                Ok(p) => to_forward_slash(p.to_string_lossy().into_owned()),
+                Err(_) => to_forward_slash(file_path.to_string_lossy().into_owned()),
+            };
+            let rel_path = if path_prefix.is_empty() {
+                raw_rel.clone()
+            } else {
+                format!("{path_prefix}/{raw_rel}")
+            };
+
+            let source = match std::fs::read(file_path) {
+                Ok(s) => s,
+                Err(_) => return None,
+            };
+
+            // Each thread gets its own parser pool
+            let pool = ParserPool::new();
+            let parse_result = match pool.parse_file(file_path, &source) {
+                Ok(p) => p.0,
+                Err(_) => return None,
+            };
+            // Infer language from file extension (quick path, parser returns more accurate)
+            let ext = std::path::Path::new(file_path)
+                .extension()
+                .and_then(|e| e.to_str())?;
+            let language = match ext.to_lowercase().as_str() {
+                "rs" => "rust",
+                "ts" | "tsx" => "typescript",
+                "js" | "jsx" => "javascript",
+                "py" => "python",
+                "go" => "go",
+                "java" => "java",
+                "swift" => "swift",
+                "kt" => "kotlin",
+                "rb" => "ruby",
+                "c" | "h" => "c",
+                "cpp" | "cc" | "cxx" | "hpp" => "c++",
+                "cs" => "csharp",
+                "php" => "php",
+                "yaml" | "yml" => "yaml",
+                "toml" => "toml",
+                "json" => "json",
+                "md" => "markdown",
+                "dart" => "dart",
+                _ => return None,
+            };
+
+            let mtime_ns = file_mtime_ns(&metadata);
+            let size_bytes = metadata.len() as i64;
+
+            Some(ParsedFile {
+                file_path: file_path.clone(),
+                raw_rel,
+                rel_path,
+                mtime_ns,
+                size_bytes,
+                source: source.to_vec(),
+                parse_result,
+                language: language.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Single-root convenience: indexes one root with no path prefix and no
@@ -524,7 +624,6 @@ pub fn full_index_root(
     extra_known: &HashSet<String>,
 ) -> Result<()> {
     let files = walker::walk_source_files(root);
-    let pool = ParserPool::new();
     let go_module = read_go_module(root);
     let dart_packages = read_dart_packages(root);
     let max_bytes = max_file_bytes();
@@ -538,23 +637,68 @@ pub fn full_index_root(
     let mut skipped: usize = 0;
     let mut updated: usize = 0;
 
-    for file_path in &files {
-        match try_ingest_file(
-            &tx,
-            file_path,
-            root,
-            path_prefix,
-            force,
-            max_bytes,
-            &pool,
-            &mut indexed,
-            &mut known_paths,
-        )? {
-            FileIngestOutcome::Ingested => updated += 1,
-            FileIngestOutcome::Unchanged => skipped += 1,
-            FileIngestOutcome::Skipped => {}
+    // Two-phase indexing: parallel parse/extract, then serial DB writes
+    // Phase 1: Parallel parse files that need re-indexing
+    let files_to_parse: Vec<_> = if force {
+        files.clone()
+    } else {
+        // First pass: check DB for unchanged files (sequential but fast)
+        files
+            .iter()
+            .filter(|f| {
+                let metadata = match std::fs::metadata(f) {
+                    Ok(m) => m,
+                    Err(_) => return true,
+                };
+                let mtime_ns = file_mtime_ns(&metadata);
+                let raw_rel = f
+                    .strip_prefix(root)
+                    .map(|p| to_forward_slash(p.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|_| to_forward_slash(f.to_string_lossy().into_owned()));
+                let rel_path = if path_prefix.is_empty() {
+                    raw_rel.clone()
+                } else {
+                    format!("{path_prefix}/{raw_rel}")
+                };
+                // Check DB - if unchanged, skip
+                match read::get_file_by_path(&tx, &rel_path) {
+                    Ok(Some(existing)) => existing.mtime_ns != mtime_ns,
+                    _ => true,
+                }
+            })
+            .cloned()
+            .collect()
+    };
+
+    // Phase 2: Parallel parse using rayon
+    tracing::info!("parsing {} files in parallel", files_to_parse.len());
+    let parsed_files = parallel_parse_files(&files_to_parse, root, path_prefix, max_bytes);
+
+    // Phase 3: Serial DB writes (consume parsed_files to avoid clone)
+    for parsed in parsed_files {
+        // by value, not reference
+        known_paths.insert(parsed.rel_path.clone());
+        if !path_prefix.is_empty() {
+            known_paths.insert(parsed.raw_rel.clone());
         }
+
+        let symbols_inserted = ingest_parsed_file(
+            &tx,
+            parsed.rel_path,
+            parsed.raw_rel,
+            parsed.mtime_ns,
+            parsed.size_bytes,
+            &parsed.source,
+            parsed.parse_result,
+            parsed.language,
+            ExistingFileStrategy::DeleteAll,
+            &mut indexed,
+        )?;
+        updated += symbols_inserted;
     }
+
+    // Files that were unchanged (not in parsed_files) count as skipped
+    skipped = files.len() - indexed.len();
 
     let deleted = remove_stale_files(&tx, root, path_prefix, &known_paths)?;
 

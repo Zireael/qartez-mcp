@@ -1739,7 +1739,10 @@ mod tests {
     fn test_get_readiness_roundtrip() {
         let conn = setup();
         // Default readiness is "ready" after schema init
-        assert_eq!(get_readiness(&conn).unwrap(), Some(crate::readiness::ReadinessState::Ready));
+        assert_eq!(
+            get_readiness(&conn).unwrap(),
+            Some(crate::readiness::ReadinessState::Ready)
+        );
 
         // Override each state and read it back
         for state in [

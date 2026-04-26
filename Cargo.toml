@@ -46,6 +46,7 @@ glob = { version = "0.3", optional = true }
 globset = "0.4"
 ignore = "0.4.25"
 notify = "8"
+rayon = "1.10"
 regex = "1.11"
 rmcp = { version = "1.4.0", features = ["server", "transport-async-rw"] }
 rusqlite = { version = "0.39.0", features = ["bundled-full"] }
