@@ -445,15 +445,30 @@ impl QartezServer {
             .map_err(|e| format!("failed to read readiness: {e}"))
     }
 
+    /// Check the current writer state by reading from the database.
+    fn current_writer_state(
+        &self,
+    ) -> std::result::Result<Option<crate::readiness::WriterState>, String> {
+        let conn = self
+            .db
+            .lock()
+            .map_err(|e| format!("db lock poisoned: {e}"))?;
+        crate::storage::read::get_writer_state(&conn)
+            .map_err(|e| format!("failed to read writer_state: {e}"))
+    }
+
     /// Build a deferred response JSON for when queries cannot be served.
     ///
     /// Per Allium `QueryDefersUntilIndexIsUsable`: returns a structured
     /// response with `status`, `readiness`, `retry_after`, and a human-
     /// readable `message`.
     fn build_deferred_response(&self, state: ReadinessState) -> String {
+        // Include writer_state if available.
+        let writer_state = self.current_writer_state().ok().flatten();
         serde_json::json!({
             "status": "deferred",
             "readiness": state,
+            "writer_state": writer_state,
             "retry_after": state.retry_after_secs(),
             "message": format!("Index not ready: {}. Retry after {} seconds.", state, state.retry_after_secs()),
         })
@@ -738,6 +753,8 @@ mod progressive_tests {
         // Tests that verify readiness gating set it explicitly.
         crate::storage::write::set_readiness(&conn, crate::readiness::ReadinessState::Ready)
             .unwrap();
+        crate::storage::write::set_writer_state(&conn, crate::readiness::WriterState::Idle)
+            .unwrap();
         QartezServer::new(conn, std::path::PathBuf::from("/tmp/test"), 0)
     }
 
@@ -921,6 +938,8 @@ mod safe_resolve_tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::storage::schema::create_schema(&conn).unwrap();
         crate::storage::write::set_readiness(&conn, crate::readiness::ReadinessState::Ready)
+            .unwrap();
+        crate::storage::write::set_writer_state(&conn, crate::readiness::WriterState::Idle)
             .unwrap();
         QartezServer::new(conn, root.to_path_buf(), 0)
     }

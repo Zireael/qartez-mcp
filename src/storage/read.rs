@@ -844,6 +844,16 @@ pub fn get_readiness(conn: &Connection) -> Result<Option<crate::readiness::Readi
         .and_then(crate::readiness::ReadinessState::from_meta))
 }
 
+/// Read the current writer state from the meta table.
+///
+/// Returns `None` when no writer_state key has been set yet.
+pub fn get_writer_state(conn: &Connection) -> Result<Option<crate::readiness::WriterState>> {
+    let raw = get_meta(conn, "writer_state")?;
+    Ok(raw
+        .as_deref()
+        .and_then(crate::readiness::WriterState::from_meta))
+}
+
 #[allow(dead_code)]
 pub fn get_stale_files(conn: &Connection) -> Result<Vec<FileRow>> {
     let mut stmt = conn.prepare(

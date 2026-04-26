@@ -452,6 +452,11 @@ pub fn set_readiness(conn: &Connection, state: crate::readiness::ReadinessState)
     set_meta(conn, "readiness", &state.to_string())
 }
 
+/// Write the current writer state to the meta table.
+pub fn set_writer_state(conn: &Connection, state: crate::readiness::WriterState) -> Result<()> {
+    set_meta(conn, "writer_state", &state.to_string())
+}
+
 pub fn clear_file_clusters(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM file_clusters", [])?;
     Ok(())

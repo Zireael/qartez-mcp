@@ -87,6 +87,61 @@ impl ReadinessState {
     }
 }
 
+/// The writer state (idle vs active) for the SQLite connection.
+///
+/// Tracks whether the background indexer or watcher is actively writing.
+/// This is separate from readiness (whether queries should be served) because
+/// writes can happen while still serving queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriterState {
+    /// No active write in progress
+    Idle,
+    /// Full index in progress (background indexer)
+    FullIndexing,
+    /// Incremental index in progress (watcher)
+    IncrementalIndexing,
+    /// Pruning stale symbols
+    Pruning,
+    /// Compacting the database
+    Compacting,
+    /// Blocked (waiting for lock)
+    Blocked,
+}
+
+impl fmt::Display for WriterState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriterState::Idle => write!(f, "idle"),
+            WriterState::FullIndexing => write!(f, "full_indexing"),
+            WriterState::IncrementalIndexing => write!(f, "incremental_indexing"),
+            WriterState::Pruning => write!(f, "pruning"),
+            WriterState::Compacting => write!(f, "compacting"),
+            WriterState::Blocked => write!(f, "blocked"),
+        }
+    }
+}
+
+impl WriterState {
+    /// Parse from the string stored in the meta table.
+    pub fn from_meta(value: &str) -> Option<Self> {
+        match value {
+            "idle" => Some(WriterState::Idle),
+            "full_indexing" => Some(WriterState::FullIndexing),
+            "incremental_indexing" => Some(WriterState::IncrementalIndexing),
+            "pruning" => Some(WriterState::Pruning),
+            "compacting" => Some(WriterState::Compacting),
+            "blocked" => Some(WriterState::Blocked),
+            _ => None,
+        }
+    }
+
+    /// Returns true if no active write is in progress.
+    pub fn is_idle(&self) -> bool {
+        matches!(self, WriterState::Idle)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,9 @@
+D:\Coding\_tools\qartez-mcp-latest\target\release\deps\tree_sitter_toml_ng-20b061b4d1e2f22f.d: C:\Users\zir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-toml-ng-0.7.0\bindings\rust\lib.rs C:\Users\zir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-toml-ng-0.7.0\bindings\rust\../../src/node-types.json C:\Users\zir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-toml-ng-0.7.0\bindings\rust\../../queries/highlights.scm
+
+D:\Coding\_tools\qartez-mcp-latest\target\release\deps\libtree_sitter_toml_ng-20b061b4d1e2f22f.rlib: C:\Users\zir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-toml-ng-0.7.0\bindings\rust\lib.rs C:\Users\zir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-toml-ng-0.7.0\bindings\rust\../../src/node-types.json C:\Users\zir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-toml-ng-0.7.0\bindings\rust\../../queries/highlights.scm
+
+D:\Coding\_tools\qartez-mcp-latest\target\release\deps\libtree_sitter_toml_ng-20b061b4d1e2f22f.rmeta: C:\Users\zir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-toml-ng-0.7.0\bindings\rust\lib.rs C:\Users\zir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-toml-ng-0.7.0\bindings\rust\../../src/node-types.json C:\Users\zir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-toml-ng-0.7.0\bindings\rust\../../queries/highlights.scm
+
+C:\Users\zir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-toml-ng-0.7.0\bindings\rust\lib.rs:
+C:\Users\zir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-toml-ng-0.7.0\bindings\rust\../../src/node-types.json:
+C:\Users\zir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-toml-ng-0.7.0\bindings\rust\../../queries/highlights.scm:

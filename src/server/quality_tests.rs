@@ -25,6 +25,7 @@ fn setup_db() -> Connection {
     schema::create_schema(&conn).unwrap();
     // Set readiness to Ready so tests don't get deferred responses.
     crate::storage::write::set_readiness(&conn, crate::readiness::ReadinessState::Ready).unwrap();
+    crate::storage::write::set_writer_state(&conn, crate::readiness::WriterState::Idle).unwrap();
     conn
 }
 

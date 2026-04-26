@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use clap::{CommandFactory, Parser};
-use qartez_mcp::{cli, cli_runner, config, git, graph, index, lock, readiness, server, storage, watch};
+use qartez_mcp::{cli, cli_runner, config, git, graph, index, lock, readiness, server, storage};
 use rmcp::ServiceExt;
 
 #[tokio::main]
@@ -162,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
             }
             // Set Indexing state before spawning background task
             storage::write::set_readiness(&conn, readiness::ReadinessState::Indexing)?;
+            storage::write::set_writer_state(&conn, readiness::WriterState::FullIndexing)?;
             tokio::task::spawn_blocking(move || {
                 // Acquire the cross-process lock first so a sibling qartez
                 // process indexing the same repo cannot race against our
@@ -260,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
                 // Note: this uses the SAME db_path, so the running server's
                 // next query will see the updated state.
                 let _ = storage::write::set_readiness(&conn, readiness::ReadinessState::Ready);
+                let _ = storage::write::set_writer_state(&conn, readiness::WriterState::Idle);
             });
         }
     } else {

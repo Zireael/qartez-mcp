@@ -166,16 +166,28 @@ impl Watcher {
                 poisoned.into_inner()
             }
         };
-        index::incremental_index_with_prefix(
+
+        // Set writer_state to IncrementalIndexing before batch.
+        crate::storage::write::set_writer_state(
             &conn,
-            &self.project_root,
-            &self.path_prefix,
-            changed,
-            deleted,
+            crate::readiness::WriterState::IncrementalIndexing,
         )?;
-        graph::pagerank::compute_pagerank(&conn, &Default::default())?;
-        graph::pagerank::compute_symbol_pagerank(&conn, &Default::default())?;
-        Ok(())
+        let result = (|| {
+            index::incremental_index_with_prefix(
+                &conn,
+                &self.project_root,
+                &self.path_prefix,
+                changed,
+                deleted,
+            )?;
+            graph::pagerank::compute_pagerank(&conn, &Default::default())?;
+            graph::pagerank::compute_symbol_pagerank(&conn, &Default::default())?;
+            Ok::<(), anyhow::Error>(())
+        })();
+
+        // Reset writer_state to Idle after batch completes (success or failure).
+        let _ = crate::storage::write::set_writer_state(&conn, crate::readiness::WriterState::Idle);
+        result
     }
 }
 

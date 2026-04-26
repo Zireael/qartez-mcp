@@ -50,6 +50,9 @@ pub fn run(config: &Config, command: &Command, format: OutputFormat) -> Result<(
             },
         )?;
         eprintln!("Index ready.");
+        // Set readiness to Ready so tools work.
+        crate::storage::write::set_readiness(&conn, crate::readiness::ReadinessState::Ready)?;
+        crate::storage::write::set_writer_state(&conn, crate::readiness::WriterState::Idle)?;
     }
 
     let server = QartezServer::with_roots(
