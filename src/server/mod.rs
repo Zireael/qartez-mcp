@@ -93,6 +93,10 @@ pub struct QartezServer {
     /// avoiding `SQLITE_BUSY` when both fire on the same repo.
     lock_dir: Option<PathBuf>,
     git_depth: u32,
+    /// Writer chunk size for watcher incremental indexing. Passed through to
+    /// each spawned Watcher so large batches can yield between chunks.
+    /// None means use the default (50).
+    writer_chunk_size: Option<usize>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
     parse_cache: Arc<Mutex<ParseCache>>,
@@ -225,6 +229,7 @@ impl QartezServer {
             watch_enabled,
             lock_dir,
             git_depth,
+            writer_chunk_size: None,
             tool_router: router,
             parse_cache: Arc::new(Mutex::new(ParseCache::default())),
             enabled_tools,
@@ -249,7 +254,8 @@ impl QartezServer {
     /// empty prefix. Mismatch here orphans incremental rows.
     pub fn attach_watcher(&self, root: PathBuf, path_prefix: String) -> anyhow::Result<()> {
         let db = self.db_arc();
-        let mut watcher = crate::watch::Watcher::with_prefix(db, root.clone(), path_prefix);
+        let chunk_size = self.writer_chunk_size.unwrap_or(crate::watch::DEFAULT_WRITER_CHUNK_SIZE);
+        let mut watcher = crate::watch::Watcher::with_prefix_with_chunk_size(db, root.clone(), path_prefix, Some(chunk_size));
         if let Some(ref lock_dir) = self.lock_dir {
             watcher = watcher.with_lock_dir(lock_dir.clone());
         }

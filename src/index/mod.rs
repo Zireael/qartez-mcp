@@ -1901,7 +1901,81 @@ pub fn incremental_index(
 /// Incremental re-index for a single root. `path_prefix` is the same
 /// prefix that [`full_index_multi`] used for this root (from
 /// [`root_prefix`]); pass `""` when there is only one root in the project.
+///
+/// Chunking: for batches larger than `chunk_size`, processes files in
+/// sub-batches of at most `chunk_size`, committing each chunk separately
+/// with a yield point between chunks so that reader tasks can make progress.
+///
+/// To disable chunking for a specific call, pass `usize::MAX` as `chunk_size`.
 pub fn incremental_index_with_prefix(
+    conn: &Connection,
+    root: &Path,
+    path_prefix: &str,
+    changed: &[PathBuf],
+    deleted: &[PathBuf],
+) -> Result<()> {
+    incremental_index_with_prefix_chunked(
+        conn,
+        root,
+        path_prefix,
+        changed,
+        deleted,
+        DEFAULT_CHUNK_SIZE,
+    )
+}
+
+/// Chunking size used by `incremental_index_with_prefix`. Set to `usize::MAX`
+/// to disable chunking.
+const DEFAULT_CHUNK_SIZE: usize = 50;
+
+/// Chunked variant. When `chunk_size == usize::MAX`, all files are processed
+/// in a single transaction with no yield points.
+pub fn incremental_index_with_prefix_chunked(
+    conn: &Connection,
+    root: &Path,
+    path_prefix: &str,
+    changed: &[PathBuf],
+    deleted: &[PathBuf],
+    chunk_size: usize,
+) -> Result<()> {
+    if changed.is_empty() && deleted.is_empty() {
+        return Ok(());
+    }
+
+    if chunk_size == usize::MAX
+        || (changed.len() <= chunk_size && deleted.len() <= chunk_size)
+    {
+        // Small enough: one-shot.
+        incremental_index_batch(conn, root, path_prefix, changed, deleted)?;
+        return Ok(());
+    }
+
+    // Large batch: chunk and yield.
+    let changed_chunks = changed.chunks(chunk_size).map(|c| c.to_vec()).collect::<Vec<_>>();
+    let deleted_chunks = deleted.chunks(chunk_size).map(|c| c.to_vec()).collect::<Vec<_>>();
+    let total = changed_chunks.len().max(deleted_chunks.len());
+
+    for i in 0..total {
+        let c = changed_chunks.get(i).map(|c| c.as_slice()).unwrap_or(&[]);
+        let d = deleted_chunks.get(i).map(|c| c.as_slice()).unwrap_or(&[]);
+
+        incremental_index_batch(conn, root, path_prefix, c, d)?;
+
+        tracing::debug!(
+            "chunked index: committed {}/{} ({}+{} files)",
+            i + 1,
+            total,
+            c.len(),
+            d.len()
+        );
+    }
+
+    Ok(())
+}
+
+/// Inner single-transaction indexing loop. Called by both the entry point
+/// and each chunk of the chunked variant.
+fn incremental_index_batch(
     conn: &Connection,
     root: &Path,
     path_prefix: &str,

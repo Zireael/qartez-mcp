@@ -180,6 +180,7 @@ mod tests {
             reindex: false,
             git_depth: 0,
             has_project: true,
+            writer_chunk_size: 50,
         }
     }
 

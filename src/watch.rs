@@ -16,6 +16,9 @@ use crate::lock::RepoLock;
 
 const QARTEZIGNORE_FILENAME: &str = ".qartezignore";
 
+/// Default writer chunk size — matches the Allium spec and acceptance.rs.
+pub const DEFAULT_WRITER_CHUNK_SIZE: usize = 50;
+
 /// Debounce window: events arriving within this interval after the first
 /// event in a batch are folded into the same re-index cycle.
 const DEBOUNCE_MS: u64 = 500;
@@ -41,6 +44,11 @@ pub struct Watcher {
     /// watcher writes without coordination (used by tests that drive
     /// indexing through an in-memory connection only).
     lock_dir: Option<PathBuf>,
+    /// Maximum number of file changes to commit in a single DB transaction.
+    /// Larger batches are split into chunks of this size, each committed
+    /// separately with a yield point between chunks so reader tasks can
+    /// make progress. Default: 50.
+    writer_chunk_size: usize,
 }
 
 impl Watcher {
@@ -53,11 +61,23 @@ impl Watcher {
         project_root: PathBuf,
         path_prefix: String,
     ) -> Self {
+        Self::with_prefix_with_chunk_size(db, project_root, path_prefix, None)
+    }
+
+    /// Full constructor: lets the caller also specify `writer_chunk_size`.
+    /// Pass `None` to use the default (50).
+    pub fn with_prefix_with_chunk_size(
+        db: Arc<Mutex<Connection>>,
+        project_root: PathBuf,
+        path_prefix: String,
+        writer_chunk_size: Option<usize>,
+    ) -> Self {
         Self {
             db,
             project_root,
             path_prefix,
             lock_dir: None,
+            writer_chunk_size: writer_chunk_size.unwrap_or(DEFAULT_WRITER_CHUNK_SIZE),
         }
     }
 
@@ -66,6 +86,15 @@ impl Watcher {
     /// cycle if another qartez process is already writing.
     pub fn with_lock_dir(mut self, lock_dir: PathBuf) -> Self {
         self.lock_dir = Some(lock_dir);
+        self
+    }
+
+    /// Set the maximum number of file changes to commit per DB transaction
+    /// during watcher-driven incremental reindexing. Large batches are split
+    /// into chunks of this size with a yield point between chunks so that
+    /// reader tasks can make progress. Default: 50.
+    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.writer_chunk_size = chunk_size;
         self
     }
 
@@ -173,12 +202,13 @@ impl Watcher {
             crate::readiness::WriterState::IncrementalIndexing,
         )?;
         let result = (|| {
-            index::incremental_index_with_prefix(
+            index::incremental_index_with_prefix_chunked(
                 &conn,
                 &self.project_root,
                 &self.path_prefix,
                 changed,
                 deleted,
+                self.writer_chunk_size,
             )?;
             graph::pagerank::compute_pagerank(&conn, &Default::default())?;
             graph::pagerank::compute_symbol_pagerank(&conn, &Default::default())?;

@@ -12,7 +12,16 @@ pub struct Config {
     pub reindex: bool,
     pub git_depth: u32,
     pub has_project: bool,
+    /// Maximum number of file changes to commit in a single DB transaction
+    /// during watcher-driven incremental reindexing. Larger batches are
+    /// split into chunks of this size, each committed separately with a
+    /// yield point between chunks so that reader tasks can make progress.
+    /// Default: 50 (matches Allium spec `writer_chunk_size`).
+    pub writer_chunk_size: usize,
 }
+
+/// Default writer chunk size — matches the Allium spec and acceptance.rs.
+pub const DEFAULT_WRITER_CHUNK_SIZE: usize = 50;
 
 const PROJECT_MARKERS: &[&str] = &[
     ".git",
@@ -421,6 +430,7 @@ impl Config {
             reindex: cli.reindex,
             git_depth: cli.git_depth,
             has_project,
+            writer_chunk_size: DEFAULT_WRITER_CHUNK_SIZE,
         })
     }
 }

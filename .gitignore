@@ -1,5 +1,23 @@
 
+# Build artifacts
+/target/
+*.exe
+*.d
+*.pdb
+*.lib
+*.exp
+
+# Cargo
+Cargo.lock
+
+# Qartez index/cache
+.qartez/
+*.db-shm
+*.db-wal
+*.lock.pid
+
 # Beads / Dolt files (added by bd init)
 .dolt/
+.beads/
 *.db
 .beads-credential-key
