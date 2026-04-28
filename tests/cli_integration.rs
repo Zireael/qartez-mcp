@@ -44,6 +44,7 @@ impl Formatter for Settings {
         reindex: false,
         git_depth: 50,
         has_project: true,
+        writer_chunk_size: 50,
     };
     (dir, config)
 }
@@ -353,6 +354,7 @@ fn cli_stats_no_project() {
         reindex: false,
         git_depth: 50,
         has_project: false,
+        writer_chunk_size: 50,
     };
     let cmd = Command::Stats { file: None };
     let result = cli_runner::run(&config, &cmd, OutputFormat::Compact);
