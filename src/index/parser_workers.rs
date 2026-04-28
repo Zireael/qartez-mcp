@@ -4,9 +4,10 @@
 //! - Created lazily on first use (no upfront grammar cost)
 //! - Per-thread to avoid locking contention
 //! - Evicted after idle timeout (configurable)
+//! - Tree cache for hot-file incremental reparsing (Phase 1)
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,14 +22,41 @@ use crate::index::symbols::ParseResult;
 pub struct ParserWorkerConfig {
     /// TTL for idle workers before eviction (default: 15 minutes)
     pub parser_idle_ttl: Duration,
+    /// TTL for hot tree cache before eviction (default: 30 minutes)
+    pub hot_tree_retention: Duration,
 }
 
 impl Default for ParserWorkerConfig {
     fn default() -> Self {
         Self {
             parser_idle_ttl: Duration::from_secs(15 * 60),
+            hot_tree_retention: Duration::from_secs(30 * 60),
         }
     }
+}
+
+/// State of a cached tree
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeCacheState {
+    /// No tree cached for this file
+    Absent,
+    /// Tree is hot and valid
+    Hot,
+    /// Tree was invalidated (needs re-parse)
+    Invalidated,
+    /// Tree was evicted from cache
+    Evicted,
+}
+
+/// A cached syntax tree with metadata
+#[derive(Debug, Clone)]
+pub struct TreeCacheEntry {
+    /// The cached tree
+    pub tree: tree_sitter::Tree,
+    /// When this tree was last parsed
+    pub cached_at: Instant,
+    /// Current cache state
+    pub state: TreeCacheState,
 }
 
 /// State of a parser worker
@@ -128,6 +156,8 @@ pub struct ParserWorkers {
     workers: HashMap<String, ParseWorker>,
     /// Configuration
     config: ParserWorkerConfig,
+    /// Tree cache for hot-file incremental reparsing (PathBuf -> TreeCacheEntry)
+    tree_cache: HashMap<PathBuf, TreeCacheEntry>,
 }
 
 impl Default for ParserWorkers {
@@ -141,7 +171,40 @@ impl ParserWorkers {
         Self {
             workers: HashMap::new(),
             config: ParserWorkerConfig::default(),
+            tree_cache: HashMap::new(),
         }
+    }
+
+    /// Get tree cache entry for a path
+    pub fn get_tree_cache(&self, path: &Path) -> Option<&TreeCacheEntry> {
+        self.tree_cache.get(path)
+    }
+
+    /// Set tree cache entry for a path
+    pub fn set_tree_cache(&mut self, path: PathBuf, entry: TreeCacheEntry) {
+        self.tree_cache.insert(path, entry);
+    }
+
+    /// Invalidate tree cache for a path (mark as needing re-parse)
+    pub fn invalidate_tree_cache(&mut self, path: &Path) {
+        if let Some(entry) = self.tree_cache.get_mut(path) {
+            entry.state = TreeCacheState::Invalidated;
+        }
+    }
+
+    /// Check if tree cache has a valid hot tree for path
+    pub fn has_hot_tree(&self, path: &Path) -> bool {
+        self.tree_cache
+            .get(path)
+            .map(|e| e.state == TreeCacheState::Hot && e.cached_at.elapsed() < self.config.hot_tree_retention)
+            .unwrap_or(false)
+    }
+
+    /// Evict expired entries from tree cache
+    pub fn evict_tree_cache(&mut self) {
+        let retention = self.config.hot_tree_retention;
+        self.tree_cache
+            .retain(|_, entry| entry.cached_at.elapsed() < retention);
     }
 
     /// Get or create a worker for the given file extension
@@ -218,14 +281,27 @@ impl ParserWorkers {
             })?;
 
         let result = support.extract(source, &tree);
+
+        // Cache the tree for hot-file incremental reparsing
+        let path_buf = path.to_path_buf();
+        let cache_entry = TreeCacheEntry {
+            tree,
+            cached_at: Instant::now(),
+            state: TreeCacheState::Hot,
+        };
+        self.tree_cache.insert(path_buf, cache_entry);
+
         Ok((result, support.language_name().to_string()))
     }
 
-    /// Clean up idle workers past TTL
+    /// Clean up idle workers past TTL and evict expired tree cache entries
     pub fn evict_idle_workers(&mut self) {
         let ttl = self.config.parser_idle_ttl;
         self.workers
             .retain(|_, worker| !worker.is_idle_too_long(ttl));
+
+        // Also evict expired tree cache entries
+        self.evict_tree_cache();
     }
 }
 
@@ -254,6 +330,29 @@ impl ThreadLocalParserWorkers {
             message: format!("failed to acquire parser lock: {}", e),
         })?;
         workers.parse_file(path, source)
+    }
+
+    /// Check if there's a hot tree cached for path
+    pub fn has_hot_tree(&self, path: &Path) -> bool {
+        self.inner
+            .lock()
+            .map(|workers| workers.has_hot_tree(path))
+            .unwrap_or(false)
+    }
+
+    /// Get tree cache entry for path
+    pub fn get_tree_cache(&self, path: &Path) -> Option<TreeCacheEntry> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|workers| workers.get_tree_cache(path).cloned())
+    }
+
+    /// Invalidate tree cache for path
+    pub fn invalidate_tree_cache(&self, path: &Path) {
+        if let Ok(mut workers) = self.inner.lock() {
+            workers.invalidate_tree_cache(path);
+        }
     }
 
     /// Clean up idle workers
