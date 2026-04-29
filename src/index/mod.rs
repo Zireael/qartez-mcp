@@ -1987,6 +1987,16 @@ fn incremental_index_batch(
     }
 
     let pool = ParserPool::new();
+    // Invalidate cached trees for changed/deleted files so the next parse
+    // falls back to a cold parse. Hot-tree incremental reuse
+    // will be handled in a later phase when ChangeSet.has_byte_edit is plumbed.
+    for path in changed {
+        pool.invalidate_tree_cache(path);
+    }
+    for path in deleted {
+        pool.invalidate_tree_cache(path);
+    }
+
     let go_module = read_go_module(root);
     let dart_packages = read_dart_packages(root);
     let max_bytes = max_file_bytes();
