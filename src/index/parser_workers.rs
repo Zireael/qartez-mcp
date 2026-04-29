@@ -128,13 +128,14 @@ impl ParseWorker {
     }
 
     /// Parse a source file (caller must ensure_language first)
-    pub fn parse(&mut self, source: &[u8]) -> Result<tree_sitter::Tree> {
+    /// When `old_tree` is `Some`, performs incremental parsing using Tree.edit()
+    pub fn parse(&mut self, source: &[u8], old_tree: Option<&tree_sitter::Tree>) -> Result<tree_sitter::Tree> {
         self.last_used = Instant::now();
         self.state = WorkerState::Parsing;
 
         let tree = self
             .parser
-            .parse(source, None)
+            .parse(source, old_tree)
             .ok_or_else(|| QartezError::Parse {
                 path: "".to_string(),
                 message: "tree-sitter parse returned None".to_string(),
@@ -263,13 +264,32 @@ impl ParserWorkers {
         source: &[u8],
         lang_ext: &str,
     ) -> Result<(ParseResult, String)> {
-        // Get or create worker for this language
+        // Phase 1: Extract old tree from cache for incremental parsing.
+        // Must be done BEFORE worker_for() to avoid borrow issues.
+        let old_tree: Option<tree_sitter::Tree> = {
+            let retention = self.config.hot_tree_retention;
+            match self.tree_cache.get(path) {
+                Some(entry) if entry.state == TreeCacheState::Hot 
+                    && entry.cached_at.elapsed() < retention => {
+                    // Clone the tree for incremental parsing
+                    Some(entry.tree.clone())
+                }
+                _ => None,
+            }
+        }; // Immutable borrow ends here.
+
+        // Phase 2: Get or create worker for this language.
         let worker = self.worker_for(lang_ext)?;
 
-        // Parse the source
-        let tree = worker.parse(source)?;
+        // Phase 3: Parse the source (incremental if we have an old tree).
+        let tree = if let Some(old) = old_tree {
+            // Incremental parsing using tree-sitter's capabilities
+            worker.parse(source, Some(&old))?
+        } else {
+            worker.parse(source, None)?
+        };
 
-        // Get language support for extraction
+        // Phase 4: Get language support for extraction.
         let support = languages::get_language_for_ext(lang_ext)
             .or_else(|| {
                 let filename = format!("file.{}", lang_ext);
@@ -282,7 +302,7 @@ impl ParserWorkers {
 
         let result = support.extract(source, &tree);
 
-        // Cache the tree for hot-file incremental reparsing
+        // Phase 5: Cache the tree for hot-file incremental reparsing.
         let path_buf = path.to_path_buf();
         let cache_entry = TreeCacheEntry {
             tree,
@@ -293,6 +313,8 @@ impl ParserWorkers {
 
         Ok((result, support.language_name().to_string()))
     }
+
+
 
     /// Clean up idle workers past TTL and evict expired tree cache entries
     pub fn evict_idle_workers(&mut self) {
