@@ -261,6 +261,17 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn,
         "ALTER TABLE files ADD COLUMN change_count INTEGER NOT NULL DEFAULT 0",
     )?;
+
+    // Hot-file incremental reparsing: track whether a cached tree exists
+    // and its state. Used by the watcher to decide cold vs incremental parse.
+    try_add_column(
+        conn,
+        "ALTER TABLE files ADD COLUMN has_hot_tree INTEGER NOT NULL DEFAULT 0",
+    )?;
+    try_add_column(
+        conn,
+        "ALTER TABLE files ADD COLUMN tree_cache TEXT NOT NULL DEFAULT 'absent'",
+    )?;
     // symbols_body_fts used to be declared as `content=''` (contentless),
     // which rejects plain `DELETE FROM`. The one-time migration drops and
     // recreates the table so `rebuild_symbol_bodies` can repopulate it.

@@ -85,6 +85,8 @@ fn row_to_file(row: &rusqlite::Row) -> rusqlite::Result<FileRow> {
         pagerank: row.get("pagerank")?,
         indexed_at: row.get("indexed_at")?,
         change_count: row.get::<_, i64>("change_count").unwrap_or(0),
+        has_hot_tree: row.get::<_, i32>("has_hot_tree").unwrap_or(0) != 0,
+        tree_cache: row.get::<_, String>("tree_cache").unwrap_or_else(|_| "absent".to_string()),
     })
 }
 
@@ -121,6 +123,8 @@ fn row_to_file_joined(row: &rusqlite::Row) -> rusqlite::Result<FileRow> {
         pagerank: row.get("f_pagerank")?,
         indexed_at: row.get("f_indexed_at")?,
         change_count: row.get::<_, i64>("f_change_count").unwrap_or(0),
+        has_hot_tree: row.get::<_, i32>("f_has_hot_tree").unwrap_or(0) != 0,
+        tree_cache: row.get::<_, String>("f_tree_cache").unwrap_or_else(|_| "absent".to_string()),
     })
 }
 
@@ -130,7 +134,9 @@ const SYMBOL_FILE_JOIN_COLS: &str = "s.id, s.file_id, s.name, s.kind, s.line_sta
      f.id AS f_id, f.path AS f_path, f.mtime_ns AS f_mtime_ns,
      f.size_bytes AS f_size_bytes, f.language AS f_language,
      f.line_count AS f_line_count, f.pagerank AS f_pagerank,
-     f.indexed_at AS f_indexed_at, f.change_count AS f_change_count";
+     f.indexed_at AS f_indexed_at, f.change_count AS f_change_count,
+                 f.has_hot_tree AS f_has_hot_tree, f.tree_cache AS f_tree_cache,
+     f.has_hot_tree AS f_has_hot_tree, f.tree_cache AS f_tree_cache";
 
 pub fn get_file_by_path(conn: &Connection, path: &str) -> Result<Option<FileRow>> {
     // Index keys are always forward-slash; MCP tool callers on Windows may
@@ -140,7 +146,7 @@ pub fn get_file_by_path(conn: &Connection, path: &str) -> Result<Option<FileRow>
     let path = crate::index::to_forward_slash(path.to_string());
     let result = conn
         .query_row(
-            "SELECT id, path, mtime_ns, size_bytes, language, line_count, pagerank, indexed_at, change_count
+            "SELECT id, path, mtime_ns, size_bytes, language, line_count, pagerank, indexed_at, change_count, has_hot_tree, tree_cache
              FROM files WHERE path = ?1",
             [path.as_str()],
             row_to_file,
@@ -151,7 +157,7 @@ pub fn get_file_by_path(conn: &Connection, path: &str) -> Result<Option<FileRow>
 
 pub fn get_all_files(conn: &Connection) -> Result<Vec<FileRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, path, mtime_ns, size_bytes, language, line_count, pagerank, indexed_at, change_count
+        "SELECT id, path, mtime_ns, size_bytes, language, line_count, pagerank, indexed_at, change_count, has_hot_tree, tree_cache
          FROM files ORDER BY path",
     )?;
     let rows = stmt.query_map([], row_to_file)?;
@@ -164,7 +170,7 @@ pub fn get_all_files(conn: &Connection) -> Result<Vec<FileRow>> {
 
 pub fn get_files_ranked(conn: &Connection, limit: i64) -> Result<Vec<FileRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, path, mtime_ns, size_bytes, language, line_count, pagerank, indexed_at, change_count
+        "SELECT id, path, mtime_ns, size_bytes, language, line_count, pagerank, indexed_at, change_count, has_hot_tree, tree_cache
          FROM files ORDER BY pagerank DESC LIMIT ?1",
     )?;
     let rows = stmt.query_map([limit], row_to_file)?;
@@ -177,7 +183,7 @@ pub fn get_files_ranked(conn: &Connection, limit: i64) -> Result<Vec<FileRow>> {
 
 pub fn get_all_files_ranked(conn: &Connection) -> Result<Vec<FileRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, path, mtime_ns, size_bytes, language, line_count, pagerank, indexed_at, change_count
+        "SELECT id, path, mtime_ns, size_bytes, language, line_count, pagerank, indexed_at, change_count, has_hot_tree, tree_cache
          FROM files ORDER BY pagerank DESC",
     )?;
     let rows = stmt.query_map([], row_to_file)?;
@@ -209,7 +215,7 @@ pub fn get_all_symbols_with_path(conn: &Connection) -> Result<Vec<(SymbolRow, St
 pub fn get_file_by_id(conn: &Connection, id: i64) -> Result<Option<FileRow>> {
     let result = conn
         .query_row(
-            "SELECT id, path, mtime_ns, size_bytes, language, line_count, pagerank, indexed_at, change_count
+            "SELECT id, path, mtime_ns, size_bytes, language, line_count, pagerank, indexed_at, change_count, has_hot_tree, tree_cache
              FROM files WHERE id = ?1",
             [id],
             row_to_file,
@@ -454,7 +460,8 @@ pub fn get_cochanges(
     let mut stmt = conn.prepare(
         "SELECT cc.file_a, cc.file_b, cc.count,
                 f.id, f.path, f.mtime_ns, f.size_bytes, f.language,
-                f.line_count, f.pagerank, f.indexed_at, f.change_count
+                f.line_count, f.pagerank, f.indexed_at, f.change_count,
+                 f.has_hot_tree, f.tree_cache
          FROM co_changes cc
          JOIN files f ON (CASE WHEN cc.file_a = ?1 THEN cc.file_b ELSE cc.file_a END) = f.id
          WHERE cc.file_a = ?1 OR cc.file_b = ?1
@@ -478,6 +485,8 @@ pub fn get_cochanges(
                 pagerank: row.get(9)?,
                 indexed_at: row.get(10)?,
                 change_count: row.get(11)?,
+                has_hot_tree: row.get::<_, i32>(12).unwrap_or(0) != 0,
+                tree_cache: row.get::<_, String>(13).unwrap_or_else(|_| "absent".to_string()),
             },
         ))
     })?;
@@ -788,7 +797,11 @@ pub fn get_symbol_references(
         // reference that happens to live in the same file.
         let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT s.id AS from_symbol_id, f.id, f.path, f.mtime_ns, f.size_bytes,
-                             f.language, f.line_count, f.pagerank, f.indexed_at, f.change_count
+                             f.language, f.line_count, f.pagerank, f.indexed_at, f.change_count,
+                              f.has_hot_tree, f.tree_cache,
+                             f.has_hot_tree, f.tree_cache,
+                 f.has_hot_tree, f.tree_cache,
+                             f.has_hot_tree, f.tree_cache
              FROM symbol_refs r
              JOIN symbols s ON s.id = r.from_symbol_id
              JOIN files f ON f.id = s.file_id
@@ -857,7 +870,7 @@ pub fn get_writer_state(conn: &Connection) -> Result<Option<crate::readiness::Wr
 #[allow(dead_code)]
 pub fn get_stale_files(conn: &Connection) -> Result<Vec<FileRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, path, mtime_ns, size_bytes, language, line_count, pagerank, indexed_at, change_count
+        "SELECT id, path, mtime_ns, size_bytes, language, line_count, pagerank, indexed_at, change_count, has_hot_tree, tree_cache
          FROM files
          WHERE NOT EXISTS (
              SELECT 1 FROM symbols WHERE symbols.file_id = files.id
@@ -988,7 +1001,8 @@ pub struct LanguageStat {
 pub fn get_most_imported_files(conn: &Connection, limit: i64) -> Result<Vec<(FileRow, i64)>> {
     let mut stmt = conn.prepare(
         "SELECT f.id, f.path, f.mtime_ns, f.size_bytes, f.language, f.line_count,
-                f.pagerank, f.indexed_at, COUNT(*) as importers, f.change_count
+                f.pagerank, f.indexed_at, COUNT(*) as importers, f.change_count,
+                 f.has_hot_tree, f.tree_cache
          FROM edges e
          JOIN files f ON e.to_file = f.id
          GROUP BY e.to_file
@@ -1007,6 +1021,8 @@ pub fn get_most_imported_files(conn: &Connection, limit: i64) -> Result<Vec<(Fil
                 pagerank: row.get(6)?,
                 indexed_at: row.get(7)?,
                 change_count: row.get(9)?,
+                has_hot_tree: row.get::<_, i32>(10).unwrap_or(0) != 0,
+                tree_cache: row.get::<_, String>(11).unwrap_or_else(|_| "absent".to_string()),
             },
             row.get::<_, i64>(8)?,
         ))
@@ -1122,7 +1138,8 @@ pub fn get_subtypes(
                 f.id AS f_id, f.path AS f_path, f.mtime_ns AS f_mtime_ns,
                 f.size_bytes AS f_size_bytes, f.language AS f_language,
                 f.line_count AS f_line_count, f.pagerank AS f_pagerank,
-                f.indexed_at AS f_indexed_at, f.change_count AS f_change_count
+                f.indexed_at AS f_indexed_at, f.change_count AS f_change_count,
+                 f.has_hot_tree AS f_has_hot_tree, f.tree_cache AS f_tree_cache
          FROM type_hierarchy h
          JOIN files f ON f.id = h.file_id
          WHERE h.super_name = ?1
@@ -1157,7 +1174,8 @@ pub fn get_supertypes(
                 f.id AS f_id, f.path AS f_path, f.mtime_ns AS f_mtime_ns,
                 f.size_bytes AS f_size_bytes, f.language AS f_language,
                 f.line_count AS f_line_count, f.pagerank AS f_pagerank,
-                f.indexed_at AS f_indexed_at, f.change_count AS f_change_count
+                f.indexed_at AS f_indexed_at, f.change_count AS f_change_count,
+                 f.has_hot_tree AS f_has_hot_tree, f.tree_cache AS f_tree_cache
          FROM type_hierarchy h
          JOIN files f ON f.id = h.file_id
          WHERE h.sub_name = ?1
@@ -1340,7 +1358,11 @@ pub fn get_symbol_references_filtered(
     for (sym, file) in symbols {
         let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT s.id AS from_symbol_id, f.id, f.path, f.mtime_ns, f.size_bytes,
-                             f.language, f.line_count, f.pagerank, f.indexed_at, f.change_count
+                             f.language, f.line_count, f.pagerank, f.indexed_at, f.change_count,
+                              f.has_hot_tree, f.tree_cache,
+                             f.has_hot_tree, f.tree_cache,
+                 f.has_hot_tree, f.tree_cache,
+                             f.has_hot_tree, f.tree_cache
              FROM symbol_refs r
              JOIN symbols s ON s.id = r.from_symbol_id
              JOIN files f ON f.id = s.file_id

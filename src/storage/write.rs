@@ -197,6 +197,11 @@ pub fn clear_file_content(conn: &Connection, file_id: i64) -> Result<()> {
     // relationships remain valid.
     conn.execute("DELETE FROM edges WHERE from_file = ?1", [file_id])?;
     conn.execute("DELETE FROM type_hierarchy WHERE file_id = ?1", [file_id])?;
+    // When file content is cleared the cached tree is stale; reset tracking.
+    conn.execute(
+        "UPDATE files SET has_hot_tree = 0, tree_cache = 'absent' WHERE id = ?1",
+        [file_id],
+    )?;
     Ok(())
 }
 
@@ -606,6 +611,23 @@ pub fn insert_type_relations(
     for (sub, sup, kind, line) in relations {
         stmt.execute(rusqlite::params![file_id, sub, sup, kind, line])?;
     }
+    Ok(())
+}
+
+/// Update the tree-cache tracking columns for a file.
+///
+/// *  - one of "hot", "cold", "absent"
+/// *  - true when an in-memory cached tree exists
+pub fn set_file_tree_cache(
+    conn: &Connection,
+    file_id: i64,
+    state: &str,
+    has_hot_tree: bool,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE files SET tree_cache = ?1, has_hot_tree = ?2 WHERE id = ?3",
+        rusqlite::params![state, has_hot_tree as i32, file_id],
+    )?;
     Ok(())
 }
 

@@ -634,6 +634,8 @@ mod tests {
             pagerank: 0.0,
             indexed_at: 0,
             change_count: 0,
+            has_hot_tree: false,
+            tree_cache: "absent".to_string(),
         }
     }
 

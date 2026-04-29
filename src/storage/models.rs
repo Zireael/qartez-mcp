@@ -12,6 +12,12 @@ pub struct FileRow {
     /// Number of git commits that touched this file within the analysis
     /// window. Zero when git history is unavailable or the file is new.
     pub change_count: i64,
+    /// Whether this file has a hot cached tree in the parser pool.
+    /// Boolean stored as INTEGER (0 = false, 1 = true).
+    pub has_hot_tree: bool,
+    /// Tree cache state: "hot", "cold", or "absent".
+    /// Used by the watcher to decide cold vs incremental parse.
+    pub tree_cache: String,
 }
 
 #[allow(dead_code)]
