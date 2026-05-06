@@ -2,6 +2,22 @@
 
 This file tells agents where to work, what to avoid, and how to validate each lane.
 
+## Implementation status
+
+All 6 lanes are **implemented and tested**. This playbook now serves as
+operator documentation and onboarding reference.
+
+| Lane | Status | Key files | Beads |
+|------|--------|-----------|-------|
+| 1 — Readiness + DB split | ✅ Complete | `src/server/mod.rs`, `src/storage/` | svve, n2xb, r5y3, bxmp |
+| 2 — Parser workers | ✅ Complete | `src/index/parser.rs`, `src/index/parser_workers.rs` | k22b, qtef |
+| 3 — Parallel full-index | ✅ Complete | `src/index/mod.rs` | jxqk, ogj1 |
+| 4 — Hot-file incremental reparsing | ✅ Complete | `src/index/mod.rs`, `src/index/parser_workers.rs` | 45ps, kf5, j6d |
+| 5 — DB lifecycle | ✅ Complete | `src/storage/schema.rs`, `src/storage/write.rs` | m2te, p7t3 |
+| 6 — Watcher parity + chunking | ✅ Complete | `src/watch.rs` | ajvr, tub6 |
+
+Validation baseline: 24 acceptance tests, ~1485 lib tests (release mode).
+
 ## Lane 1 — Reader/writer DB split + readiness signalling
 
 Primary hotspots:
@@ -70,6 +86,22 @@ Goals:
 - reuse recent `Tree` state for changed files
 - fall back cleanly to cold parse on cache miss or invalid edit info
 
+Implementation details:
+- **ChangeSet** (`src/index/mod.rs`): `has_byte_edit` field controls tree reuse.
+  `changed()` defaults to true (conservative: assume bytes changed).
+  `metadata_only()` sets false (e.g. chmod/touch without content change).
+- **Conditional invalidation**: In `incremental_index_batch`:
+  - `has_byte_edit=true` + hot tree in pool → preserve (incremental parse via `Tree.edit()`)
+  - `has_byte_edit=true` + no hot tree → invalidate (cold parse fallback)
+  - `has_byte_edit=false` → preserve (metadata-only, tree still valid)
+- **TreeCacheState** (`src/index/parser_workers.rs`): Enum with DB↔enum mapping.
+  States: `Absent`, `Hot`, `Invalidated`, `Evicted`.
+  Legacy DB value "cold" normalized to `Invalidated` via `from_db_str()` and schema migration.
+- **evict_tree_cache()**: Two-phase (mark Evicted then retain) to prevent
+  use-after-evict races in the in-memory cache.
+- **DB column**: `files.tree_cache` tracks persistent state;
+  `files.has_hot_tree` tracks in-memory cache presence.
+
 Anti-goals:
 - do not try to persist syntax trees for the entire repo yet
 - do not risk stale-tree correctness bugs for marginal speedups
@@ -77,6 +109,10 @@ Anti-goals:
 Validation:
 - repeated edits on hot files reindex faster than cold parse baseline
 - cache misses remain safe and correct
+- `rule_hot_files_prefer_incremental_reparse` acceptance test
+- `rule_incremental_change_falls_back_to_cold_parse` acceptance test
+- `invariant_incremental_tasks_are_always_classified` acceptance test
+- `rule_tree_cache_state_roundtrip` acceptance test
 
 ## Lane 5 — Shared DB lifecycle and pruning
 

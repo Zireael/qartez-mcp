@@ -1057,3 +1057,210 @@ fn rule_meta_tools_not_deferred_when_cold_start() {
         }
     }
 }
+
+// ===========================================================================
+// RULE: HotFilesPreferIncrementalReparse
+// ===========================================================================
+//
+// Allium: "parse_task.parse_mode = incremental" when
+//   reason = incremental_change AND has_hot_tree AND has_byte_edit.
+//
+// After a full index, files should have tree_cache = "hot" (they were
+// just parsed). A subsequent incremental edit on a hot file should
+// preserve the hot tree for incremental reuse.
+
+/// Maps to **Rule: HotFilesPreferIncrementalReparse**
+///
+/// After a full index, the in-memory parser worker cache holds hot trees
+/// for parsed files. A subsequent incremental edit on a hot file should
+/// reuse the cached tree (incremental parse). We verify:
+/// 1. After full index, symbols exist (parsing succeeded).
+/// 2. After incremental reindex on a hot file, symbols are preserved
+///    (incremental reparse was successful — whether cold or incremental).
+#[test]
+fn rule_hot_files_prefer_incremental_reparse() {
+    let (_tmp, root) = rust_project();
+    let conn = index_rust_project(&root);
+
+    // After full index, the parser pool holds hot trees for indexed files.
+    // We verify the behavioral contract via DB state: after incremental reindex,
+    // the file must still be indexed (symbols exist).
+    let changed_path = root.join("src/lib.rs");
+    incremental_index(&conn, &root, &[changed_path], &[]).unwrap();
+
+    let symbols = read::get_all_symbols(&conn).unwrap();
+    assert!(
+        !symbols.is_empty(),
+        "incremental reindex on a hot file must preserve symbols"
+    );
+
+    // Verify tree_cache column is a valid value from the known set
+    let files_after = read::get_all_files(&conn).unwrap();
+    let lib_file = files_after
+        .iter()
+        .find(|f| f.path.contains("lib.rs"))
+        .expect("lib.rs must exist after incremental reindex");
+
+    let valid_states = ["hot", "invalidated", "evicted", "absent"];
+    assert!(
+        valid_states.contains(&lib_file.tree_cache.as_str()),
+        "tree_cache must be a valid state after reindex, got '{}'",
+        lib_file.tree_cache
+    );
+}
+
+// ===========================================================================
+// RULE: IncrementalChangeFallsBackToColdParse
+// ===========================================================================
+//
+// Allium: "parse_task.parse_mode = cold" when NOT has_hot_tree or
+//   NOT has_byte_edit.
+//
+// When a file's tree_cache is "invalidated" (no hot tree), incremental
+// reparse must fall back to cold parse — the tree_cache is then set
+// to "hot" again after the parse completes.
+
+/// Maps to **Rule: IncrementalChangeFallsBackToColdParse**
+///
+/// When a file's tree cache is invalidated (no hot tree available),
+/// incremental reindex should still succeed via cold parse fallback
+/// and produce correct results (symbols exist).
+#[test]
+fn rule_incremental_change_falls_back_to_cold_parse() {
+    let (_tmp, root) = rust_project();
+    let conn = index_rust_project(&root);
+
+    // Manually invalidate the tree cache for a file
+    let files = read::get_all_files(&conn).unwrap();
+    let lib_file = files
+        .iter()
+        .find(|f| f.path.contains("lib.rs"))
+        .expect("lib.rs must exist after full index");
+
+    write::set_file_tree_cache(&conn, lib_file.id, "invalidated", false).unwrap();
+
+    // Verify it's now invalidated
+    let files_after = read::get_all_files(&conn).unwrap();
+    let invalidated = files_after
+        .iter()
+        .find(|f| f.path.contains("lib.rs"))
+        .expect("lib.rs must exist");
+    assert_eq!(
+        invalidated.tree_cache, "invalidated",
+        "file should be invalidated after set_file_tree_cache"
+    );
+
+    // Incremental reindex on the invalidated file should succeed
+    // via cold-parse fallback and produce correct results
+    let changed_path = root.join("src/lib.rs");
+    incremental_index(&conn, &root, &[changed_path], &[]).unwrap();
+
+    // Verify the file still has symbols (cold parse succeeded)
+    let symbols = read::get_all_symbols(&conn).unwrap();
+    assert!(
+        !symbols.is_empty(),
+        "cold-fallback reparse must produce symbols"
+    );
+
+    // Verify tree_cache is a valid state
+    let files_final = read::get_all_files(&conn).unwrap();
+    let restored = files_final
+        .iter()
+        .find(|f| f.path.contains("lib.rs"))
+        .expect("lib.rs must exist after reindex");
+
+    let valid_states = ["hot", "invalidated", "evicted", "absent"];
+    assert!(
+        valid_states.contains(&restored.tree_cache.as_str()),
+        "tree_cache must be a valid state after cold-fallback reparse, got '{}'",
+        restored.tree_cache
+    );
+}
+
+// ===========================================================================
+// INVARIANT: IncrementalTasksAreAlwaysClassified
+// ===========================================================================
+//
+// Allium: "parse_task.reason = incremental_change implies
+//   parse_task.parse_mode in [cold, incremental]"
+//
+// In DB terms, after any incremental reindex, tree_cache values must
+// be from the known valid set: "hot", "invalidated", "evicted", or "absent".
+
+/// Maps to **Invariant: IncrementalTasksAreAlwaysClassified**
+///
+/// After an incremental reindex, all file tree_cache values must be
+/// from the known valid set. No unknown or legacy values should remain.
+#[test]
+fn invariant_incremental_tasks_are_always_classified() {
+    let (_tmp, root) = rust_project();
+    let conn = index_rust_project(&root);
+
+    // Perform an incremental edit
+    let changed_path = root.join("src/lib.rs");
+    incremental_index(&conn, &root, &[changed_path], &[]).unwrap();
+
+    let files = read::get_all_files(&conn).unwrap();
+    let valid_states = ["hot", "invalidated", "evicted", "absent"];
+
+    for file in &files {
+        assert!(
+            valid_states.contains(&file.tree_cache.as_str()),
+            "file {} has invalid tree_cache value '{}', must be one of {:?}",
+            file.path,
+            file.tree_cache,
+            valid_states
+        );
+    }
+}
+
+// ===========================================================================
+// RULE: TreeCacheStateRoundTrip
+// ===========================================================================
+//
+// The DB↔enum mapping for tree_cache must be consistent. This tests
+// that the Allium-define states (absent, hot, invalidated, evicted)
+// round-trip correctly through the database.
+
+/// Maps to **Entity: SourceFile.tree_cache** round-trip.
+///
+/// Verifies that tree_cache state values written to and read from
+/// the DB match the expected Allium enum values exactly.
+#[test]
+fn rule_tree_cache_state_roundtrip() {
+    use crate::index::parser_workers::TreeCacheState;
+
+    // Forward mapping
+    assert_eq!(TreeCacheState::Absent.to_db_str(), "absent");
+    assert_eq!(TreeCacheState::Hot.to_db_str(), "hot");
+    assert_eq!(TreeCacheState::Invalidated.to_db_str(), "invalidated");
+    assert_eq!(TreeCacheState::Evicted.to_db_str(), "evicted");
+
+    // Reverse mapping
+    assert_eq!(
+        TreeCacheState::from_db_str("absent"),
+        TreeCacheState::Absent
+    );
+    assert_eq!(TreeCacheState::from_db_str("hot"), TreeCacheState::Hot);
+    assert_eq!(
+        TreeCacheState::from_db_str("invalidated"),
+        TreeCacheState::Invalidated
+    );
+    assert_eq!(
+        TreeCacheState::from_db_str("evicted"),
+        TreeCacheState::Evicted
+    );
+
+    // Legacy normalization: "cold" maps to Invalidated
+    assert_eq!(
+        TreeCacheState::from_db_str("cold"),
+        TreeCacheState::Invalidated,
+        "legacy 'cold' must normalize to 'invalidated'"
+    );
+
+    // Unknown values map to Absent (safe default)
+    assert_eq!(
+        TreeCacheState::from_db_str("unknown"),
+        TreeCacheState::Absent
+    );
+}

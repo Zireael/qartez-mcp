@@ -62,12 +62,15 @@ bd update <id> --status blocked --notes "Blocked on <other-id> / design decision
 ## For this program
 
 Recommended top-level sequencing:
-1. baseline/acceptance harness
-2. readiness contract
-3. DB split
-4. watcher parity + chunking
-5. parser workers
-6. parallel full-index
-7. hot-file incremental reparse
-8. shared DB lifecycle
-9. rollout docs + regressions
+1. baseline/acceptance harness ✅
+2. readiness contract ✅
+3. DB split ✅
+4. watcher parity + chunking ✅
+5. parser workers ✅
+6. parallel full-index ✅
+7. hot-file incremental reparse ✅
+8. shared DB lifecycle ✅
+9. rollout docs + regressions ✅ (i9sy in progress)
+
+All 6 implementation lanes are complete. See `docs/agents/high-roi-implementation-playbook.md`
+for per-lane status, validation rules, and operator documentation.

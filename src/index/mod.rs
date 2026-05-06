@@ -9,7 +9,6 @@ use rayon::prelude::*;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use rusqlite::Connection;
 
@@ -87,6 +86,7 @@ fn max_file_bytes() -> u64 {
 
 /// Intermediate result from parallel parse phase, before serial DB writes.
 /// Holds everything needed to write to DB in the second phase.
+#[allow(dead_code)] // file_path is read in incremental_index_batch
 struct ParsedFile {
     file_path: PathBuf,
     raw_rel: String,
@@ -482,7 +482,7 @@ fn resolve_and_write_import_edges(
 /// `extra_known` is a pre-populated set of paths from other roots. It is
 /// merged into the local `known_paths` before import resolution so that
 /// cross-root imports can find their targets.
-/// Outcome of processing a single source file during full-index ingestion.
+#[allow(dead_code)] // used in tests
 enum FileIngestOutcome {
     /// File was parsed and its symbols were appended to `indexed`.
     Ingested,
@@ -497,6 +497,7 @@ enum FileIngestOutcome {
 /// and ingest. Each fallible step either returns early with an outcome or
 /// continues. Extracted from `full_index_root` so the per-file decisions stay
 /// isolated from the surrounding pipeline.
+#[allow(dead_code)] // used in tests
 #[allow(clippy::too_many_arguments)]
 fn try_ingest_file(
     tx: &Connection,
@@ -668,7 +669,6 @@ pub fn full_index_root(
 
     let mut indexed: Vec<IndexedFile> = Vec::new();
     let mut known_paths: HashSet<String> = extra_known.clone();
-    let mut skipped: usize = 0;
     let mut updated: usize = 0;
 
     // Two-phase indexing: parallel parse/extract, then serial DB writes
@@ -732,7 +732,7 @@ pub fn full_index_root(
     }
 
     // Files that were unchanged (not in parsed_files) count as skipped
-    skipped = files.len() - indexed.len();
+    let skipped = files.len() - indexed.len();
 
     let deleted = remove_stale_files(&tx, root, path_prefix, &known_paths)?;
 

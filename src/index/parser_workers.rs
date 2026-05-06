@@ -131,12 +131,12 @@ impl ParseWorker {
 
         let support = languages::get_language_for_ext(ext)
             .or_else(|| {
-                let filename = format!("file.{}", ext);
+                let filename = format!("file.{ext}");
                 languages::get_language_for_filename(&filename)
             })
             .ok_or_else(|| QartezError::Parse {
                 path: "".to_string(),
-                message: format!("unsupported extension: {}", ext),
+                message: format!("unsupported extension: {ext}"),
             })?;
 
         let lang = support.tree_sitter_language(ext);
@@ -144,7 +144,7 @@ impl ParseWorker {
             .set_language(&lang)
             .map_err(|e| QartezError::Parse {
                 path: "".to_string(),
-                message: format!("failed to set language: {}", e),
+                message: format!("failed to set language: {e}"),
             })?;
 
         self.state = WorkerState::Idle;
@@ -292,9 +292,8 @@ impl ParserWorkers {
         if lang_ext.is_empty() {
             return Err(QartezError::Parse {
                 path: path.display().to_string(),
-                message: format!("unsupported file: {}", filename),
-            }
-            .into());
+                message: format!("unsupported file: {filename}"),
+            });
         }
 
         self.parse_with_key(path, source, &lang_ext)
@@ -336,12 +335,12 @@ impl ParserWorkers {
         // Phase 4: Get language support for extraction.
         let support = languages::get_language_for_ext(lang_ext)
             .or_else(|| {
-                let filename = format!("file.{}", lang_ext);
+                let filename = format!("file.{lang_ext}");
                 languages::get_language_for_filename(&filename)
             })
             .ok_or_else(|| QartezError::Parse {
                 path: path.display().to_string(),
-                message: format!("unsupported language: {}", lang_ext),
+                message: format!("unsupported language: {lang_ext}"),
             })?;
 
         let result = support.extract(source, &tree);
@@ -391,7 +390,7 @@ impl ThreadLocalParserWorkers {
     pub fn parse_file(&self, path: &Path, source: &[u8]) -> Result<(ParseResult, String)> {
         let mut workers = self.inner.lock().map_err(|e| QartezError::Parse {
             path: path.display().to_string(),
-            message: format!("failed to acquire parser lock: {}", e),
+            message: format!("failed to acquire parser lock: {e}"),
         })?;
         workers.parse_file(path, source)
     }
