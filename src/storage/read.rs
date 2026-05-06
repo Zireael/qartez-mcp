@@ -86,7 +86,9 @@ fn row_to_file(row: &rusqlite::Row) -> rusqlite::Result<FileRow> {
         indexed_at: row.get("indexed_at")?,
         change_count: row.get::<_, i64>("change_count").unwrap_or(0),
         has_hot_tree: row.get::<_, i32>("has_hot_tree").unwrap_or(0) != 0,
-        tree_cache: row.get::<_, String>("tree_cache").unwrap_or_else(|_| "absent".to_string()),
+        tree_cache: row
+            .get::<_, String>("tree_cache")
+            .unwrap_or_else(|_| "absent".to_string()),
     })
 }
 
@@ -124,7 +126,9 @@ fn row_to_file_joined(row: &rusqlite::Row) -> rusqlite::Result<FileRow> {
         indexed_at: row.get("f_indexed_at")?,
         change_count: row.get::<_, i64>("f_change_count").unwrap_or(0),
         has_hot_tree: row.get::<_, i32>("f_has_hot_tree").unwrap_or(0) != 0,
-        tree_cache: row.get::<_, String>("f_tree_cache").unwrap_or_else(|_| "absent".to_string()),
+        tree_cache: row
+            .get::<_, String>("f_tree_cache")
+            .unwrap_or_else(|_| "absent".to_string()),
     })
 }
 
@@ -486,7 +490,9 @@ pub fn get_cochanges(
                 indexed_at: row.get(10)?,
                 change_count: row.get(11)?,
                 has_hot_tree: row.get::<_, i32>(12).unwrap_or(0) != 0,
-                tree_cache: row.get::<_, String>(13).unwrap_or_else(|_| "absent".to_string()),
+                tree_cache: row
+                    .get::<_, String>(13)
+                    .unwrap_or_else(|_| "absent".to_string()),
             },
         ))
     })?;
@@ -1022,7 +1028,9 @@ pub fn get_most_imported_files(conn: &Connection, limit: i64) -> Result<Vec<(Fil
                 indexed_at: row.get(7)?,
                 change_count: row.get(9)?,
                 has_hot_tree: row.get::<_, i32>(10).unwrap_or(0) != 0,
-                tree_cache: row.get::<_, String>(11).unwrap_or_else(|_| "absent".to_string()),
+                tree_cache: row
+                    .get::<_, String>(11)
+                    .unwrap_or_else(|_| "absent".to_string()),
             },
             row.get::<_, i64>(8)?,
         ))

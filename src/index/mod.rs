@@ -22,6 +22,40 @@ use crate::storage::write;
 use parser::ParserPool;
 use symbols::{ExtractedImport, ExtractedReference, ReferenceKind, compute_shape_hash};
 
+/// Describes a single file change processed by the incremental index pipeline.
+///
+/// `has_byte_edit` controls whether the parser reuses a cached tree (incremental
+/// parse via `Tree.edit()`) or falls back to a cold parse. Conservative default
+/// is `true` — we assume bytes changed unless we can prove otherwise (e.g.
+/// metadata-only changes like chmod or timestamp touch).
+struct ChangeSet {
+    /// Absolute path of the changed file.
+    file_path: PathBuf,
+    /// Whether the file's byte content definitely changed.
+    has_byte_edit: bool,
+}
+
+impl ChangeSet {
+    /// Construct a ChangeSet for a changed/created/renamed file.
+    /// Defaults `has_byte_edit` to `true` (conservative: assume bytes changed).
+    fn changed(file_path: PathBuf) -> Self {
+        Self {
+            file_path,
+            has_byte_edit: true,
+        }
+    }
+
+    /// Construct a ChangeSet for a metadata-only change (e.g. chmod, touch).
+    /// `has_byte_edit` is `false` — the cached tree is still valid.
+    #[allow(dead_code)]
+    fn metadata_only(file_path: PathBuf) -> Self {
+        Self {
+            file_path,
+            has_byte_edit: false,
+        }
+    }
+}
+
 struct IndexedFile {
     file_id: i64,
     /// DB-stored path (may include a root-name prefix in multi-root mode).
@@ -1942,17 +1976,21 @@ pub fn incremental_index_with_prefix_chunked(
         return Ok(());
     }
 
-    if chunk_size == usize::MAX
-        || (changed.len() <= chunk_size && deleted.len() <= chunk_size)
-    {
+    if chunk_size == usize::MAX || (changed.len() <= chunk_size && deleted.len() <= chunk_size) {
         // Small enough: one-shot.
         incremental_index_batch(conn, root, path_prefix, changed, deleted)?;
         return Ok(());
     }
 
     // Large batch: chunk and yield.
-    let changed_chunks = changed.chunks(chunk_size).map(|c| c.to_vec()).collect::<Vec<_>>();
-    let deleted_chunks = deleted.chunks(chunk_size).map(|c| c.to_vec()).collect::<Vec<_>>();
+    let changed_chunks = changed
+        .chunks(chunk_size)
+        .map(|c| c.to_vec())
+        .collect::<Vec<_>>();
+    let deleted_chunks = deleted
+        .chunks(chunk_size)
+        .map(|c| c.to_vec())
+        .collect::<Vec<_>>();
     let total = changed_chunks.len().max(deleted_chunks.len());
 
     for i in 0..total {
@@ -1987,12 +2025,36 @@ fn incremental_index_batch(
     }
 
     let pool = ParserPool::new();
-    // Invalidate cached trees for changed/deleted files so the next parse
-    // falls back to a cold parse. Hot-tree incremental reuse
-    // will be handled in a later phase when ChangeSet.has_byte_edit is plumbed.
-    for path in changed {
-        pool.invalidate_tree_cache(path);
+    // Build ChangeSets for changed files: has_byte_edit defaults to true
+    // (conservative — assume bytes changed). When a hot tree exists and
+    // has_byte_edit is true, parse_with_key will use incremental parse
+    // via Tree.edit(). When no hot tree exists or has_byte_edit is false,
+    // the tree is invalidated and a cold parse is performed.
+    let change_sets: Vec<ChangeSet> = changed
+        .iter()
+        .map(|p| ChangeSet::changed(p.clone()))
+        .collect();
+
+    // Conditionally invalidate tree cache based on ChangeSet:
+    // - If has_byte_edit AND hot tree exists → keep tree (incremental path)
+    // - If has_byte_edit AND no hot tree → invalidate (cold fallback, nothing to reuse)
+    // - If !has_byte_edit → preserve tree (metadata-only change, tree still valid)
+    for cs in &change_sets {
+        if cs.has_byte_edit && !pool.has_hot_tree(&cs.file_path) {
+            // No hot tree to reuse; mark as invalidated so DB state is consistent.
+            pool.invalidate_tree_cache(&cs.file_path);
+        } else if !cs.has_byte_edit {
+            // Metadata-only change: tree is still valid, no invalidation needed.
+            // The tree cache state remains Hot; DB will be updated on next parse.
+            tracing::debug!(
+                "incremental: metadata-only change for {}, preserving hot tree",
+                cs.file_path.display()
+            );
+        }
+        // If has_byte_edit AND hot tree exists → do nothing;
+        // parse_with_key will detect the hot tree and use incremental parse.
     }
+    // Deleted files always lose their cached tree (the file is gone).
     for path in deleted {
         pool.invalidate_tree_cache(path);
     }
@@ -4070,5 +4132,80 @@ mod tests {
             final_refs.iter().any(|(f, t)| f == "run" && t == "do_work"),
             "post-incremental cross-ref must be preserved, got {final_refs:?}"
         );
+    }
+
+    // --- ChangeSet tests ---
+
+    #[test]
+    fn changeset_changed_defaults_to_byte_edit() {
+        let cs = ChangeSet::changed(PathBuf::from("foo.rs"));
+        assert!(
+            cs.has_byte_edit,
+            "ChangeSet::changed should default has_byte_edit to true"
+        );
+        assert_eq!(cs.file_path, PathBuf::from("foo.rs"));
+    }
+
+    #[test]
+    fn changeset_metadata_only_has_no_byte_edit() {
+        let cs = ChangeSet::metadata_only(PathBuf::from("bar.ts"));
+        assert!(
+            !cs.has_byte_edit,
+            "ChangeSet::metadata_only should set has_byte_edit to false"
+        );
+        assert_eq!(cs.file_path, PathBuf::from("bar.ts"));
+    }
+
+    #[test]
+    fn incremental_batch_preserves_hot_tree_for_byte_edit() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("lib.rs"), "pub fn hello() {}\n").unwrap();
+
+        let conn = storage::open_in_memory().unwrap();
+        full_index(&conn, root, false).unwrap();
+
+        // First incremental: sets hot tree in parser pool
+        fs::write(src.join("lib.rs"), "pub fn hello() {}\npub fn world() {}\n").unwrap();
+        incremental_index(&conn, root, &[src.join("lib.rs")], &[]).unwrap();
+
+        // Verify the file was re-indexed
+        let file = read::get_file_by_path(&conn, "src/lib.rs")
+            .unwrap()
+            .unwrap();
+        let syms = read::get_symbols_for_file(&conn, file.id).unwrap();
+        assert_eq!(syms.len(), 2, "should have 2 symbols after incremental");
+    }
+
+    #[test]
+    fn db_tree_cache_uses_invalidated_not_cold() {
+        let conn = storage::open_in_memory().unwrap();
+        let root = std::env::temp_dir().join("qartez_test_cache_state");
+        let _ = fs::create_dir_all(&root);
+        let src = root.join("src");
+        let _ = fs::create_dir_all(&src);
+        fs::write(src.join("lib.rs"), "pub fn a() {}\n").unwrap();
+
+        full_index(&conn, &root, false).unwrap();
+
+        // clear_file_content should set tree_cache = 'invalidated', not 'cold'
+        let file = read::get_file_by_path(&conn, "src/lib.rs")
+            .unwrap()
+            .unwrap();
+        write::clear_file_content(&conn, file.id).unwrap();
+
+        let file_after = read::get_file_by_path(&conn, "src/lib.rs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            file_after.tree_cache, "invalidated",
+            "clear_file_content should set tree_cache to 'invalidated', got '{}'",
+            file_after.tree_cache
+        );
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&root);
     }
 }

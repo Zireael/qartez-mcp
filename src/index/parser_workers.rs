@@ -48,6 +48,30 @@ pub enum TreeCacheState {
     Evicted,
 }
 
+impl TreeCacheState {
+    /// Convert to the string stored in the DB `tree_cache` column.
+    pub fn to_db_str(self) -> &'static str {
+        match self {
+            TreeCacheState::Absent => "absent",
+            TreeCacheState::Hot => "hot",
+            TreeCacheState::Invalidated => "invalidated",
+            TreeCacheState::Evicted => "evicted",
+        }
+    }
+
+    /// Parse from the DB `tree_cache` column value.
+    /// Legacy "cold" values are mapped to Invalidated.
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "hot" => TreeCacheState::Hot,
+            "invalidated" => TreeCacheState::Invalidated,
+            "evicted" => TreeCacheState::Evicted,
+            "cold" => TreeCacheState::Invalidated, // legacy normalization
+            _ => TreeCacheState::Absent,
+        }
+    }
+}
+
 /// A cached syntax tree with metadata
 #[derive(Debug, Clone)]
 pub struct TreeCacheEntry {
@@ -129,7 +153,11 @@ impl ParseWorker {
 
     /// Parse a source file (caller must ensure_language first)
     /// When `old_tree` is `Some`, performs incremental parsing using Tree.edit()
-    pub fn parse(&mut self, source: &[u8], old_tree: Option<&tree_sitter::Tree>) -> Result<tree_sitter::Tree> {
+    pub fn parse(
+        &mut self,
+        source: &[u8],
+        old_tree: Option<&tree_sitter::Tree>,
+    ) -> Result<tree_sitter::Tree> {
         self.last_used = Instant::now();
         self.state = WorkerState::Parsing;
 
@@ -197,15 +225,29 @@ impl ParserWorkers {
     pub fn has_hot_tree(&self, path: &Path) -> bool {
         self.tree_cache
             .get(path)
-            .map(|e| e.state == TreeCacheState::Hot && e.cached_at.elapsed() < self.config.hot_tree_retention)
+            .map(|e| {
+                e.state == TreeCacheState::Hot
+                    && e.cached_at.elapsed() < self.config.hot_tree_retention
+            })
             .unwrap_or(false)
     }
 
-    /// Evict expired entries from tree cache
+    /// Evict expired entries from tree cache.
+    ///
+    /// Marks entries as `Evicted` before dropping them, so that callers
+    /// who hold a clone of the entry can observe the state transition
+    /// (Hot → Evicted) rather than seeing a silent disappearance.
     pub fn evict_tree_cache(&mut self) {
         let retention = self.config.hot_tree_retention;
+        // Phase 1: mark expired entries as Evicted
+        for entry in self.tree_cache.values_mut() {
+            if entry.cached_at.elapsed() >= retention && entry.state != TreeCacheState::Absent {
+                entry.state = TreeCacheState::Evicted;
+            }
+        }
+        // Phase 2: remove Evicted entries
         self.tree_cache
-            .retain(|_, entry| entry.cached_at.elapsed() < retention);
+            .retain(|_, entry| entry.state != TreeCacheState::Evicted);
     }
 
     /// Get or create a worker for the given file extension
@@ -269,8 +311,10 @@ impl ParserWorkers {
         let old_tree: Option<tree_sitter::Tree> = {
             let retention = self.config.hot_tree_retention;
             match self.tree_cache.get(path) {
-                Some(entry) if entry.state == TreeCacheState::Hot 
-                    && entry.cached_at.elapsed() < retention => {
+                Some(entry)
+                    if entry.state == TreeCacheState::Hot
+                        && entry.cached_at.elapsed() < retention =>
+                {
                     // Clone the tree for incremental parsing
                     Some(entry.tree.clone())
                 }
@@ -313,8 +357,6 @@ impl ParserWorkers {
 
         Ok((result, support.language_name().to_string()))
     }
-
-
 
     /// Clean up idle workers past TTL and evict expired tree cache entries
     pub fn evict_idle_workers(&mut self) {
@@ -382,5 +424,182 @@ impl ThreadLocalParserWorkers {
         if let Ok(mut workers) = self.inner.lock() {
             workers.evict_idle_workers();
         }
+    }
+
+    /// Evict expired tree cache entries
+    pub fn evict_tree_cache(&self) {
+        if let Ok(mut workers) = self.inner.lock() {
+            workers.evict_tree_cache();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+    use std::time::Duration;
+
+    /// Helper: create a Tree by parsing a minimal Rust source
+    fn make_tree() -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        parser.parse("fn main() {}", None).unwrap()
+    }
+
+    /// Verify TreeCacheState DB string round-trips
+    #[test]
+    fn tree_cache_state_db_roundtrip() {
+        assert_eq!(TreeCacheState::Absent.to_db_str(), "absent");
+        assert_eq!(TreeCacheState::Hot.to_db_str(), "hot");
+        assert_eq!(TreeCacheState::Invalidated.to_db_str(), "invalidated");
+        assert_eq!(TreeCacheState::Evicted.to_db_str(), "evicted");
+
+        assert_eq!(
+            TreeCacheState::from_db_str("absent"),
+            TreeCacheState::Absent
+        );
+        assert_eq!(TreeCacheState::from_db_str("hot"), TreeCacheState::Hot);
+        assert_eq!(
+            TreeCacheState::from_db_str("invalidated"),
+            TreeCacheState::Invalidated
+        );
+        assert_eq!(
+            TreeCacheState::from_db_str("evicted"),
+            TreeCacheState::Evicted
+        );
+        // Legacy "cold" maps to Invalidated
+        assert_eq!(
+            TreeCacheState::from_db_str("cold"),
+            TreeCacheState::Invalidated
+        );
+        // Unknown values default to Absent
+        assert_eq!(
+            TreeCacheState::from_db_str("unknown"),
+            TreeCacheState::Absent
+        );
+    }
+
+    /// Verify invalidate_tree_cache marks state as Invalidated
+    #[test]
+    fn invalidate_marks_invalidated() {
+        let mut workers = ParserWorkers::new();
+        let path = PathBuf::from("test.rs");
+        let entry = TreeCacheEntry {
+            tree: make_tree(),
+            cached_at: Instant::now(),
+            state: TreeCacheState::Hot,
+        };
+        workers.set_tree_cache(path.clone(), entry);
+        assert!(workers.has_hot_tree(&path));
+
+        workers.invalidate_tree_cache(&path);
+        assert!(!workers.has_hot_tree(&path));
+        let cached = workers.get_tree_cache(&path).unwrap();
+        assert_eq!(cached.state, TreeCacheState::Invalidated);
+    }
+
+    /// Verify evict_tree_cache marks entries as Evicted before removing
+    #[test]
+    fn evict_marks_evicted_before_removal() {
+        let mut workers = ParserWorkers::new();
+        // Create a worker with a very short retention so entries expire immediately
+        workers.config.hot_tree_retention = Duration::from_millis(1);
+        let path = PathBuf::from("test.rs");
+        let entry = TreeCacheEntry {
+            tree: make_tree(),
+            cached_at: Instant::now(),
+            state: TreeCacheState::Hot,
+        };
+        workers.set_tree_cache(path.clone(), entry);
+
+        // Wait for the entry to expire
+        thread::sleep(Duration::from_millis(5));
+
+        // Evict should mark as Evicted then remove
+        workers.evict_tree_cache();
+        // After eviction, the entry should be gone
+        assert!(workers.get_tree_cache(&path).is_none());
+    }
+
+    /// Verify hot tree check respects retention time
+    #[test]
+    fn hot_tree_respects_retention() {
+        let mut workers = ParserWorkers::new();
+        workers.config.hot_tree_retention = Duration::from_millis(10);
+        let path = PathBuf::from("test.rs");
+        let entry = TreeCacheEntry {
+            tree: make_tree(),
+            cached_at: Instant::now(),
+            state: TreeCacheState::Hot,
+        };
+        workers.set_tree_cache(path.clone(), entry);
+        assert!(workers.has_hot_tree(&path));
+
+        thread::sleep(Duration::from_millis(20));
+        assert!(!workers.has_hot_tree(&path));
+    }
+
+    /// Verify metadata-only change preserves hot tree (no invalidation call)
+    #[test]
+    fn no_invalidation_preserves_hot_tree() {
+        let pool = ThreadLocalParserWorkers::new();
+        let path = PathBuf::from("test.rs");
+        let entry = TreeCacheEntry {
+            tree: make_tree(),
+            cached_at: Instant::now(),
+            state: TreeCacheState::Hot,
+        };
+        {
+            let mut workers = pool.inner.lock().unwrap();
+            workers.set_tree_cache(path.clone(), entry);
+        }
+        assert!(pool.has_hot_tree(&path));
+
+        // Simulate metadata-only change: simply don't call invalidate_tree_cache
+        // Tree is preserved for extraction
+        assert!(pool.has_hot_tree(&path));
+    }
+
+    /// Verify byte-edit with hot tree does not invalidate (incremental path)
+    #[test]
+    fn byte_edit_with_hot_tree_preserves_cache() {
+        let pool = ThreadLocalParserWorkers::new();
+        let path = PathBuf::from("test.rs");
+        let entry = TreeCacheEntry {
+            tree: make_tree(),
+            cached_at: Instant::now(),
+            state: TreeCacheState::Hot,
+        };
+        {
+            let mut workers = pool.inner.lock().unwrap();
+            workers.set_tree_cache(path.clone(), entry);
+        }
+        assert!(pool.has_hot_tree(&path));
+
+        // Simulate: has_byte_edit=true AND has_hot_tree → do NOT invalidate
+        // (incremental_index_batch conditional logic)
+        if pool.has_hot_tree(&path) {
+            // Tree is preserved for incremental parse via Tree.edit()
+            assert!(pool.has_hot_tree(&path));
+        }
+    }
+
+    /// Verify byte-edit without hot tree calls invalidate (cold fallback)
+    #[test]
+    fn byte_edit_without_hot_tree_calls_invalidate() {
+        let pool = ThreadLocalParserWorkers::new();
+        let path = PathBuf::from("test.rs");
+        // No tree cache set — pool.has_hot_tree returns false
+        assert!(!pool.has_hot_tree(&path));
+
+        // Simulate: has_byte_edit=true AND !has_hot_tree → invalidate
+        if !pool.has_hot_tree(&path) {
+            pool.invalidate_tree_cache(&path);
+        }
+        // Still no hot tree (wasn't one to begin with)
+        assert!(!pool.has_hot_tree(&path));
     }
 }

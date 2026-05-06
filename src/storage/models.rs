@@ -15,7 +15,9 @@ pub struct FileRow {
     /// Whether this file has a hot cached tree in the parser pool.
     /// Boolean stored as INTEGER (0 = false, 1 = true).
     pub has_hot_tree: bool,
-    /// Tree cache state: "hot", "cold", or "absent".
+    /// Tree cache state: "hot", "invalidated", "evicted", or "absent".
+    /// Maps to in-memory TreeCacheState enum values. "cold" is deprecated;
+    /// new code uses "invalidated" or "evicted" instead.
     /// Used by the watcher to decide cold vs incremental parse.
     pub tree_cache: String,
 }

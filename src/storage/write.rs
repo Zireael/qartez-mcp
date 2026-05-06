@@ -197,9 +197,10 @@ pub fn clear_file_content(conn: &Connection, file_id: i64) -> Result<()> {
     // relationships remain valid.
     conn.execute("DELETE FROM edges WHERE from_file = ?1", [file_id])?;
     conn.execute("DELETE FROM type_hierarchy WHERE file_id = ?1", [file_id])?;
-    // When file content is cleared the cached tree is stale; reset tracking.
+    // When file content is cleared the cached tree is stale; mark as invalidated
+    // rather than absent (the tree existed but is no longer valid for extraction).
     conn.execute(
-        "UPDATE files SET has_hot_tree = 0, tree_cache = 'absent' WHERE id = ?1",
+        "UPDATE files SET has_hot_tree = 0, tree_cache = 'invalidated' WHERE id = ?1",
         [file_id],
     )?;
     Ok(())
@@ -616,8 +617,8 @@ pub fn insert_type_relations(
 
 /// Update the tree-cache tracking columns for a file.
 ///
-/// *  - one of "hot", "cold", "absent"
-/// *  - true when an in-memory cached tree exists
+/// * `state` - one of "hot", "invalidated", "evicted", or "absent"
+/// * `has_hot_tree` - true when an in-memory cached tree exists
 pub fn set_file_tree_cache(
     conn: &Connection,
     file_id: i64,

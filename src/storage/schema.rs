@@ -272,6 +272,20 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn,
         "ALTER TABLE files ADD COLUMN tree_cache TEXT NOT NULL DEFAULT 'absent'",
     )?;
+    // Normalize legacy "cold" tree_cache values to "invalidated".
+    // The in-memory TreeCacheState enum uses Invalidated (not "cold"),
+    // and new code only writes "hot"/"invalidated"/"evicted"/"absent".
+    {
+        let changed = conn.execute(
+            "UPDATE files SET tree_cache = 'invalidated' WHERE tree_cache = 'cold'",
+            [],
+        )?;
+        if changed > 0 {
+            tracing::info!(
+                "migrated {changed} file(s) from legacy tree_cache='cold' to 'invalidated'"
+            );
+        }
+    }
     // symbols_body_fts used to be declared as `content=''` (contentless),
     // which rejects plain `DELETE FROM`. The one-time migration drops and
     // recreates the table so `rebuild_symbol_bodies` can repopulate it.

@@ -1648,6 +1648,7 @@ dependencies = [
  "ignore",
  "notify",
  "ort",
+ "rayon",
  "regex",
  "rmcp",
  "rusqlite",

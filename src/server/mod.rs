@@ -254,8 +254,15 @@ impl QartezServer {
     /// empty prefix. Mismatch here orphans incremental rows.
     pub fn attach_watcher(&self, root: PathBuf, path_prefix: String) -> anyhow::Result<()> {
         let db = self.db_arc();
-        let chunk_size = self.writer_chunk_size.unwrap_or(crate::watch::DEFAULT_WRITER_CHUNK_SIZE);
-        let mut watcher = crate::watch::Watcher::with_prefix_with_chunk_size(db, root.clone(), path_prefix, Some(chunk_size));
+        let chunk_size = self
+            .writer_chunk_size
+            .unwrap_or(crate::watch::DEFAULT_WRITER_CHUNK_SIZE);
+        let mut watcher = crate::watch::Watcher::with_prefix_with_chunk_size(
+            db,
+            root.clone(),
+            path_prefix,
+            Some(chunk_size),
+        );
         if let Some(ref lock_dir) = self.lock_dir {
             watcher = watcher.with_lock_dir(lock_dir.clone());
         }
