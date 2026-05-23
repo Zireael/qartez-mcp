@@ -1,6 +1,6 @@
 //! Thread-local lazy-loaded parser workers.
 //!
-//! Replaces single Mutex<Parser> bottleneck with per-language workers that are:
+//! Replaces single `Mutex<Parser>` bottleneck with per-language workers that are:
 //! - Created lazily on first use (no upfront grammar cost)
 //! - Per-thread to avoid locking contention
 //! - Evicted after idle timeout (configurable)
