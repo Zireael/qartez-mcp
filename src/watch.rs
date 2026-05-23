@@ -278,14 +278,14 @@ impl Watcher {
 
         // Set writer_state to IncrementalIndexing before batch.
         if let Err(e) = crate::storage::write::set_writer_state(
-            &conn,
+            conn,
             crate::readiness::WriterState::IncrementalIndexing,
         ) {
             tracing::warn!("watcher: failed to set writer_state to IncrementalIndexing: {e}");
         }
         let result = (|| {
             index::incremental_index_with_prefix_chunked(
-                &conn,
+                conn,
                 &self.project_root,
                 &self.path_prefix,
                 changed,
@@ -319,7 +319,7 @@ impl<'a> AsRef<Connection> for ConnectionAdapter<'a> {
     fn as_ref(&self) -> &Connection {
         match self {
             ConnectionAdapter::Owned(c) => c,
-            ConnectionAdapter::LockGuard(g) => &*g,
+            ConnectionAdapter::LockGuard(g) => g,
         }
     }
 }
@@ -453,8 +453,8 @@ fn is_interesting_path(
     let name = path.file_name().and_then(|n| n.to_str());
     let stem = path.file_stem().and_then(|s| s.to_str());
 
-    let by_extension = ext.map_or(false, |e| extensions.contains(e));
-    let by_filename = name.map_or(false, |n| filenames.contains(n));
+    let by_extension = ext.is_some_and(|e| extensions.contains(e));
+    let by_filename = name.is_some_and(|n| filenames.contains(n));
     let by_prefix = stem.map_or(false, |s| {
         prefixes.iter().any(|prefix| s.starts_with(prefix))
     });
