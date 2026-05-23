@@ -233,9 +233,8 @@ impl QartezServer {
         // the watcher falls back to the shared connection.
         let db_path = conn
             .path()
-            .map(|s| s.to_string_lossy().into_owned())
             .filter(|s| !s.is_empty())
-            .map(PathBuf::from);
+            .map(|s| PathBuf::from(s));
 
         Self {
             db: Arc::new(Mutex::new(conn)),

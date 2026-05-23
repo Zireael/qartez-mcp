@@ -30,12 +30,14 @@ enum DbSource {
     /// Production: open a dedicated connection to the on-disk database.
     /// Used when the server was started with a file-backed database.
     Path(PathBuf),
-    /// Test / CLI: use a caller-supplied in-memory connection.
-    /// Used when `Watcher` is constructed directly with a connection.
-    Connection(Connection),
-    /// Legacy fallback: share the server's `Arc<Mutex<Connection>>`.
-    /// Used when the database is in-memory and the caller cannot pass
-    /// ownership (e.g. the Noria test harness which creates many servers).
+    /// Shared connection: wraps `Connection` in `Arc<Mutex>` so that
+    /// `Watcher: Sync` and `&Watcher: Send` (required by `tokio::spawn`).
+    ///
+    /// Two concrete callers:
+    /// - Tests that construct a `Watcher` via `new_with_connection` or
+    ///   `with_prefix_with_connection` (single-owner, no contention).
+    /// - The legacy fallback path in `attach_watcher` where the server
+    ///   passes `self.db_arc()` (shared connection, in-memory test DBs).
     Arc(Arc<Mutex<Connection>>),
 }
 
@@ -79,7 +81,8 @@ impl Watcher {
         Self::with_prefix_with_chunk_size(db_path, project_root, path_prefix, None)
     }
 
-    /// Test / CLI constructor: use a caller-supplied in-memory connection.
+    /// Test / CLI constructor: use a caller-supplied connection, wrapped
+    /// in `Arc<Mutex>` so the watcher is `Sync`.
     pub fn new_with_connection(conn: Connection, project_root: PathBuf) -> Self {
         Self::with_prefix_with_connection(conn, project_root, String::new(), None)
     }
@@ -100,7 +103,9 @@ impl Watcher {
         }
     }
 
-    /// Full test / CLI constructor with a caller-supplied in-memory connection.
+    /// Full test / CLI constructor with a caller-supplied connection.
+    /// The connection is wrapped in `Arc<Mutex>` so the watcher is `Sync`
+    /// and can be passed to `tokio::spawn`.
     pub fn with_prefix_with_connection(
         conn: Connection,
         project_root: PathBuf,
@@ -108,7 +113,7 @@ impl Watcher {
         writer_chunk_size: Option<usize>,
     ) -> Self {
         Self {
-            db: DbSource::Connection(conn),
+            db: DbSource::Arc(Arc::new(Mutex::new(conn))),
             project_root,
             path_prefix,
             lock_dir: None,
@@ -117,7 +122,7 @@ impl Watcher {
     }
 
     /// Fallback constructor for in-memory test databases where the caller
-    /// cannot pass ownership of the connection.  Uses `Arc<Mutex>` sharing
+    /// already has an `Arc<Mutex<Connection>>`.  Uses `Arc<Mutex>` sharing
     /// (the legacy pattern), which is fine for tests but causes lock
     /// contention in production.  Prefer `new` or `new_with_connection`
     /// whenever possible.
@@ -162,25 +167,14 @@ impl Watcher {
     ///   a fresh connection to the on-disk database is opened (production
     ///   path).  This completely eliminates contention with the server's
     ///   shared connection.
-    fn get_conn(&self) -> anyhow::Result<ConnectionAdapter<'_>> {
+    fn get_conn(&self) -> anyhow::Result<ConnectionAdapter> {
         match &self.db {
             DbSource::Path(path) => {
                 let conn = crate::storage::open_db(path)?;
                 Ok(ConnectionAdapter::Owned(conn))
             }
-            DbSource::Connection(conn) => {
-                // Safety: the caller must ensure the connection outlives any
-                // reindex calls.  In practice this is guaranteed because
-                // `run()` holds a reference to `self` for the lifetime of
-                // the async task, and the connection is stored inline.
-                let ptr = conn as *const Connection;
-                Ok(ConnectionAdapter::Borrowed(unsafe { &*ptr }))
-            }
             DbSource::Arc(arc) => {
                 let guard = arc.lock().expect("watcher DB mutex poisoned");
-                // Safety: `guard` lives as long as `ConnectionAdapter`, and
-                // the MutexGuard is stored inline so it won't be dropped
-                // until the adapter is.
                 Ok(ConnectionAdapter::LockGuard(guard))
             }
         }
@@ -313,11 +307,11 @@ impl Watcher {
     }
 }
 
-/// Adapter that lets `reindex` work with either a borrowed or owned
-/// `rusqlite::Connection`.
+/// Adapter that lets `reindex` work with either an owned `Connection`
+/// (production: freshly opened per batch) or a `MutexGuard` to a shared
+/// connection (test / legacy fallback path).
 enum ConnectionAdapter<'a> {
     Owned(Connection),
-    Borrowed(&'a Connection),
     LockGuard(MutexGuard<'a, Connection>),
 }
 
@@ -325,7 +319,6 @@ impl<'a> AsRef<Connection> for ConnectionAdapter<'a> {
     fn as_ref(&self) -> &Connection {
         match self {
             ConnectionAdapter::Owned(c) => c,
-            ConnectionAdapter::Borrowed(c) => c,
             ConnectionAdapter::LockGuard(g) => &*g,
         }
     }
@@ -376,9 +369,9 @@ fn fs_mtime(path: &Path) -> Option<SystemTime> {
 
 fn start_notify_watcher(
     project_root: PathBuf,
-    extensions: HashSet<&str>,
-    filenames: HashSet<&str>,
-    prefixes: Vec<&str>,
+    extensions: HashSet<&'static str>,
+    filenames: HashSet<&'static str>,
+    prefixes: Vec<&'static str>,
     tx: mpsc::Sender<WatchBatch>,
 ) -> anyhow::Result<RecommendedWatcher> {
     let mut gitignore_cache = QartezIgnoreCache::new(&project_root);
