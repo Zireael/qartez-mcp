@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use ignore::gitignore::Gitignore;
@@ -24,12 +24,19 @@ pub const DEFAULT_WRITER_CHUNK_SIZE: usize = 50;
 const DEBOUNCE_MS: u64 = 500;
 
 /// Source of the database connection for a watcher, allowing either a file
-/// path (production) or an pre-opened in-memory connection (tests).
+/// path (production), a pre-opened in-memory connection (tests), or the
+/// legacy shared `Arc<Mutex<Connection>>` (in-memory test fallback).
 enum DbSource {
     /// Production: open a dedicated connection to the on-disk database.
+    /// Used when the server was started with a file-backed database.
     Path(PathBuf),
     /// Test / CLI: use a caller-supplied in-memory connection.
+    /// Used when `Watcher` is constructed directly with a connection.
     Connection(Connection),
+    /// Legacy fallback: share the server's `Arc<Mutex<Connection>>`.
+    /// Used when the database is in-memory and the caller cannot pass
+    /// ownership (e.g. the Noria test harness which creates many servers).
+    Arc(Arc<Mutex<Connection>>),
 }
 
 /// A batch of filesystem events, separated into changed (created/modified)
@@ -109,6 +116,26 @@ impl Watcher {
         }
     }
 
+    /// Fallback constructor for in-memory test databases where the caller
+    /// cannot pass ownership of the connection.  Uses `Arc<Mutex>` sharing
+    /// (the legacy pattern), which is fine for tests but causes lock
+    /// contention in production.  Prefer `new` or `new_with_connection`
+    /// whenever possible.
+    pub fn with_prefix_with_arc(
+        db: Arc<Mutex<Connection>>,
+        project_root: PathBuf,
+        path_prefix: String,
+        writer_chunk_size: Option<usize>,
+    ) -> Self {
+        Self {
+            db: DbSource::Arc(db),
+            project_root,
+            path_prefix,
+            lock_dir: None,
+            writer_chunk_size: writer_chunk_size.unwrap_or(DEFAULT_WRITER_CHUNK_SIZE),
+        }
+    }
+
     /// Set the directory hosting the cross-process index lock. The watcher
     /// will acquire the lock briefly before each re-index and skip the
     /// cycle if another qartez process is already writing.
@@ -148,6 +175,13 @@ impl Watcher {
                 // the async task, and the connection is stored inline.
                 let ptr = conn as *const Connection;
                 Ok(ConnectionAdapter::Borrowed(unsafe { &*ptr }))
+            }
+            DbSource::Arc(arc) => {
+                let guard = arc.lock().expect("watcher DB mutex poisoned");
+                // Safety: `guard` lives as long as `ConnectionAdapter`, and
+                // the MutexGuard is stored inline so it won't be dropped
+                // until the adapter is.
+                Ok(ConnectionAdapter::LockGuard(guard))
             }
         }
     }
@@ -284,6 +318,7 @@ impl Watcher {
 enum ConnectionAdapter<'a> {
     Owned(Connection),
     Borrowed(&'a Connection),
+    LockGuard(MutexGuard<'a, Connection>),
 }
 
 impl<'a> AsRef<Connection> for ConnectionAdapter<'a> {
@@ -291,6 +326,7 @@ impl<'a> AsRef<Connection> for ConnectionAdapter<'a> {
         match self {
             ConnectionAdapter::Owned(c) => c,
             ConnectionAdapter::Borrowed(c) => c,
+            ConnectionAdapter::LockGuard(g) => &*g,
         }
     }
 }

@@ -69,6 +69,14 @@ impl RootSource {
 #[derive(Clone)]
 pub struct QartezServer {
     db: Arc<Mutex<Connection>>,
+    /// Path to the on-disk database file.
+    ///
+    /// Extracted automatically from the SQLite connection via `conn.path()`
+    /// during `build()`.  File-backed connections return `Some(path)`; in-
+    /// memory connections return `None`.  `attach_watcher` uses this to
+    /// open a dedicated SQLite connection for the watcher (production) or
+    /// fall back to the shared connection (in-memory test databases).
+    db_path: Option<PathBuf>,
     project_root: PathBuf,
     project_roots: Arc<RwLock<Vec<PathBuf>>>,
     root_aliases: Arc<RwLock<HashMap<PathBuf, String>>>,
@@ -219,8 +227,19 @@ impl QartezServer {
             .collect();
         let enabled_tools = tiers::initial_enabled_tools(&all_names);
 
+        // Extract the on-disk path so `attach_watcher` can give the
+        // watcher its own dedicated SQLite connection for production
+        // databases.  In-memory connections (tests) return `None` and
+        // the watcher falls back to the shared connection.
+        let db_path = conn
+            .path()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+
         Self {
             db: Arc::new(Mutex::new(conn)),
+            db_path,
             project_root,
             project_roots: Arc::new(RwLock::new(project_roots)),
             root_aliases: Arc::new(RwLock::new(root_aliases)),
@@ -256,12 +275,23 @@ impl QartezServer {
         let chunk_size = self
             .writer_chunk_size
             .unwrap_or(crate::watch::DEFAULT_WRITER_CHUNK_SIZE);
-        let mut watcher = crate::watch::Watcher::with_prefix_with_connection(
-            self.db_arc(),
-            root.clone(),
-            path_prefix,
-            Some(chunk_size),
-        );
+        let mut watcher = if let Some(ref db_path) = self.db_path {
+            // Production path: give the watcher its own dedicated connection.
+            crate::watch::Watcher::with_prefix_with_chunk_size(
+                db_path.clone(),
+                root.clone(),
+                path_prefix,
+                Some(chunk_size),
+            )
+        } else {
+            // In-memory test path: share the server's connection.
+            crate::watch::Watcher::with_prefix_with_arc(
+                self.db_arc(),
+                root.clone(),
+                path_prefix,
+                Some(chunk_size),
+            )
+        };
         if let Some(ref lock_dir) = self.lock_dir {
             watcher = watcher.with_lock_dir(lock_dir.clone());
         }
