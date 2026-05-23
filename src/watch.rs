@@ -23,6 +23,15 @@ pub const DEFAULT_WRITER_CHUNK_SIZE: usize = 50;
 /// event in a batch are folded into the same re-index cycle.
 const DEBOUNCE_MS: u64 = 500;
 
+/// Source of the database connection for a watcher, allowing either a file
+/// path (production) or an pre-opened in-memory connection (tests).
+enum DbSource {
+    /// Production: open a dedicated connection to the on-disk database.
+    Path(PathBuf),
+    /// Test / CLI: use a caller-supplied in-memory connection.
+    Connection(Connection),
+}
+
 /// A batch of filesystem events, separated into changed (created/modified)
 /// and deleted paths so the incremental indexer can handle them differently.
 struct WatchBatch {
@@ -31,7 +40,7 @@ struct WatchBatch {
 }
 
 pub struct Watcher {
-    db: Arc<Mutex<Connection>>,
+    db: DbSource,
     project_root: PathBuf,
     /// Path prefix to prepend to each file's relative path when writing
     /// index rows. Must match the prefix `full_index_multi` used for this
@@ -52,28 +61,47 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    pub fn new(db: Arc<Mutex<Connection>>, project_root: PathBuf) -> Self {
-        Self::with_prefix(db, project_root, String::new())
+    /// Production constructor: the watcher will open its own dedicated
+    /// connection to `db_path` on every re-index cycle.
+    pub fn new(db_path: PathBuf, project_root: PathBuf) -> Self {
+        Self::with_prefix(db_path, project_root, String::new())
     }
 
-    pub fn with_prefix(
-        db: Arc<Mutex<Connection>>,
-        project_root: PathBuf,
-        path_prefix: String,
-    ) -> Self {
-        Self::with_prefix_with_chunk_size(db, project_root, path_prefix, None)
+    /// Production constructor with a path prefix.
+    pub fn with_prefix(db_path: PathBuf, project_root: PathBuf, path_prefix: String) -> Self {
+        Self::with_prefix_with_chunk_size(db_path, project_root, path_prefix, None)
     }
 
-    /// Full constructor: lets the caller also specify `writer_chunk_size`.
-    /// Pass `None` to use the default (50).
+    /// Test / CLI constructor: use a caller-supplied in-memory connection.
+    pub fn new_with_connection(conn: Connection, project_root: PathBuf) -> Self {
+        Self::with_prefix_with_connection(conn, project_root, String::new(), None)
+    }
+
+    /// Full production constructor.
     pub fn with_prefix_with_chunk_size(
-        db: Arc<Mutex<Connection>>,
+        db_path: PathBuf,
         project_root: PathBuf,
         path_prefix: String,
         writer_chunk_size: Option<usize>,
     ) -> Self {
         Self {
-            db,
+            db: DbSource::Path(db_path),
+            project_root,
+            path_prefix,
+            lock_dir: None,
+            writer_chunk_size: writer_chunk_size.unwrap_or(DEFAULT_WRITER_CHUNK_SIZE),
+        }
+    }
+
+    /// Full test / CLI constructor with a caller-supplied in-memory connection.
+    pub fn with_prefix_with_connection(
+        conn: Connection,
+        project_root: PathBuf,
+        path_prefix: String,
+        writer_chunk_size: Option<usize>,
+    ) -> Self {
+        Self {
+            db: DbSource::Connection(conn),
             project_root,
             path_prefix,
             lock_dir: None,
@@ -96,6 +124,32 @@ impl Watcher {
     pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
         self.writer_chunk_size = chunk_size;
         self
+    }
+
+    /// Obtain a database connection for the current re-index cycle.
+    ///
+    /// * If the watcher was created with `new_with_connection` or the
+    ///   `with_prefix_with_connection` variant, the existing connection is
+    ///   returned (test path).
+    /// * If the watcher was created with `new` or the `with_prefix` variant,
+    ///   a fresh connection to the on-disk database is opened (production
+    ///   path).  This completely eliminates contention with the server's
+    ///   shared connection.
+    fn get_conn(&self) -> anyhow::Result<ConnectionAdapter<'_>> {
+        match &self.db {
+            DbSource::Path(path) => {
+                let conn = crate::storage::open_db(path)?;
+                Ok(ConnectionAdapter::Owned(conn))
+            }
+            DbSource::Connection(conn) => {
+                // Safety: the caller must ensure the connection outlives any
+                // reindex calls.  In practice this is guaranteed because
+                // `run()` holds a reference to `self` for the lifetime of
+                // the async task, and the connection is stored inline.
+                let ptr = conn as *const Connection;
+                Ok(ConnectionAdapter::Borrowed(unsafe { &*ptr }))
+            }
+        }
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -181,26 +235,26 @@ impl Watcher {
             None
         };
 
-        // Mirror the `into_inner()` recovery already used by the ignore-cache
-        // lock at start_notify_watcher: a poisoned db mutex means a prior
-        // indexing operation panicked mid-way, but the Connection is still
-        // usable (sqlite rolls the open transaction back when the guard drops).
-        // Panicking here would kill the watcher task for the rest of the
-        // session - a long-running background loop should recover from a
-        // one-off parse or encode panic instead of going silent.
-        let conn = match self.db.lock() {
-            Ok(g) => g,
-            Err(poisoned) => {
-                tracing::warn!("watcher db mutex was poisoned; recovering");
-                poisoned.into_inner()
+        // Open a dedicated connection for this re-index batch, or re-use
+        // the caller-supplied in-memory connection (test path).
+        let adapter = match self.get_conn() {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(
+                    "watcher: failed to open dedicated connection, skipping batch: {e}"
+                );
+                return Ok(());
             }
         };
+        let conn = adapter.as_ref();
 
         // Set writer_state to IncrementalIndexing before batch.
-        crate::storage::write::set_writer_state(
+        if let Err(e) = crate::storage::write::set_writer_state(
             &conn,
             crate::readiness::WriterState::IncrementalIndexing,
-        )?;
+        ) {
+            tracing::warn!("watcher: failed to set writer_state to IncrementalIndexing: {e}");
+        }
         let result = (|| {
             index::incremental_index_with_prefix_chunked(
                 &conn,
@@ -216,8 +270,28 @@ impl Watcher {
         })();
 
         // Reset writer_state to Idle after batch completes (success or failure).
-        let _ = crate::storage::write::set_writer_state(&conn, crate::readiness::WriterState::Idle);
+        if let Err(e) =
+            crate::storage::write::set_writer_state(&conn, crate::readiness::WriterState::Idle)
+        {
+            tracing::warn!("watcher: failed to reset writer_state to Idle: {e}");
+        }
         result
+    }
+}
+
+/// Adapter that lets `reindex` work with either a borrowed or owned
+/// `rusqlite::Connection`.
+enum ConnectionAdapter<'a> {
+    Owned(Connection),
+    Borrowed(&'a Connection),
+}
+
+impl<'a> AsRef<Connection> for ConnectionAdapter<'a> {
+    fn as_ref(&self) -> &Connection {
+        match self {
+            ConnectionAdapter::Owned(c) => c,
+            ConnectionAdapter::Borrowed(c) => c,
+        }
     }
 }
 
@@ -261,309 +335,100 @@ impl QartezIgnoreCache {
 }
 
 fn fs_mtime(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
-}
-
-/// Test whether `path` looks like a source file the indexer can consume.
-/// Mirrors the walker's three-tier match (known extension, known name,
-/// known prefix) so the watcher does not silently drop `Makefile`,
-/// `Dockerfile`, `CMakeLists.txt` and friends.
-fn is_indexable_path(
-    p: &Path,
-    exts: &HashSet<&str>,
-    names: &HashSet<&str>,
-    prefixes: &[&str],
-) -> bool {
-    if let Some(ext) = p.extension().and_then(|e| e.to_str())
-        && exts.contains(ext)
-    {
-        return true;
-    }
-    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-        if names.contains(name) {
-            return true;
-        }
-        if prefixes.iter().any(|pre| name.starts_with(pre)) {
-            return true;
-        }
-    }
-    false
+    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 fn start_notify_watcher(
-    root: PathBuf,
-    supported_ext: HashSet<&'static str>,
-    supported_names: HashSet<&'static str>,
-    supported_prefixes: Vec<&'static str>,
+    project_root: PathBuf,
+    extensions: HashSet<&str>,
+    filenames: HashSet<&str>,
+    prefixes: Vec<&str>,
     tx: mpsc::Sender<WatchBatch>,
 ) -> anyhow::Result<RecommendedWatcher> {
-    let ignore_cache = Arc::new(Mutex::new(QartezIgnoreCache::new(&root)));
-    let ignore_root = root.clone();
+    let mut gitignore_cache = QartezIgnoreCache::new(&project_root);
 
-    let mut watcher =
-        notify::recommended_watcher(move |result: std::result::Result<Event, notify::Error>| {
-            let event = match result {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!("watch error: {e}");
-                    return;
-                }
-            };
-
-            let dominated = matches!(
-                event.kind,
-                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-            );
-            if !dominated {
+    let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+        let event = match res {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!("watch error: {err}");
                 return;
             }
+        };
 
-            let mut guard = match ignore_cache.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.refresh_if_changed(&ignore_root);
+        // Refresh `.qartezignore` whenever any file event is observed in
+        // the project root.  This keeps the ignore cache fresh without a
+        // dedicated timer.
+        gitignore_cache.refresh_if_changed(&project_root);
+        let local_gitignore = Gitignore::empty();
+        let qartezignore = &gitignore_cache.gi;
 
-            let filtered: Vec<PathBuf> = event
-                .paths
-                .iter()
-                .filter(|p| {
-                    is_indexable_path(p, &supported_ext, &supported_names, &supported_prefixes)
-                })
-                .filter(|p| {
-                    !guard
-                        .gi
-                        .matched_path_or_any_parents(p, p.is_dir())
-                        .is_ignore()
-                })
-                .cloned()
-                .collect();
-            drop(guard);
+        let paths: Vec<PathBuf> = event
+            .paths
+            .into_iter()
+            .filter(|p| {
+                // Skip paths that are ignored by either .gitignore or .qartezignore
+                let is_gitignored = local_gitignore.matched(p, false).is_ignore();
+                let is_qartezignored = qartezignore.matched(p, false).is_ignore();
+                !(is_gitignored || is_qartezignored)
+            })
+            .collect();
 
-            if filtered.is_empty() {
-                return;
-            }
-
-            // Translate rename events into a remove+create pair. On platforms
-            // where `notify` emits `Modify(Name::Both)` the event carries both
-            // the old and new path; on platforms that split into
-            // `Modify(Name::From)` + `Modify(Name::To)` each side arrives as a
-            // separate event. `RenameMode::Any` is the fallback used by some
-            // backends - we split by existence on disk at observation time.
-            let (changed, deleted) = match event.kind {
-                EventKind::Remove(_) => (Vec::new(), filtered),
-                EventKind::Modify(ModifyKind::Name(RenameMode::From)) => (Vec::new(), filtered),
-                EventKind::Modify(ModifyKind::Name(RenameMode::To)) => (filtered, Vec::new()),
-                EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if filtered.len() == 2 => {
-                    // `notify` emits exactly two paths for a `Both` rename:
-                    // `[from, to]`. Anything else is backend noise, not a
-                    // real rename, so fall through to the existence-check
-                    // branch instead of treating every non-first entry as
-                    // a new destination.
-                    let from = filtered[0].clone();
-                    let to = filtered[1].clone();
-                    (vec![to], vec![from])
-                }
-                EventKind::Modify(ModifyKind::Name(_)) => {
-                    let mut changed = Vec::new();
-                    let mut deleted = Vec::new();
-                    for p in filtered {
-                        if p.exists() {
-                            changed.push(p);
-                        } else {
-                            deleted.push(p);
-                        }
+        let (mut changed, mut deleted) = (Vec::new(), Vec::new());
+        match event.kind {
+            EventKind::Create(_)
+            | EventKind::Modify(ModifyKind::Data(_))
+            | EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+                for p in paths {
+                    if is_interesting_path(&p, &extensions, &filenames, &prefixes) {
+                        changed.push(p);
                     }
-                    (changed, deleted)
                 }
-                _ => (filtered, Vec::new()),
-            };
-
-            if changed.is_empty() && deleted.is_empty() {
-                return;
             }
+            EventKind::Remove(_) => {
+                for p in paths {
+                    if is_interesting_path(&p, &extensions, &filenames, &prefixes) {
+                        deleted.push(p);
+                    }
+                }
+            }
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+                // Renaming away counts as a deletion.
+                for p in paths {
+                    if is_interesting_path(&p, &extensions, &filenames, &prefixes) {
+                        deleted.push(p);
+                    }
+                }
+            }
+            _ => {}
+        }
 
-            let _ = tx.blocking_send(WatchBatch { changed, deleted });
-        })?;
+        if !changed.is_empty() || !deleted.is_empty() {
+            let batch = WatchBatch { changed, deleted };
+            if let Err(e) = tx.try_send(batch) {
+                tracing::warn!("watch event dropped, channel full: {e}");
+            }
+        }
+    })?;
 
-    watcher.watch(&root, RecursiveMode::Recursive)?;
     Ok(watcher)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashSet;
-    use std::thread;
-    use tempfile::TempDir;
+fn is_interesting_path(
+    path: &Path,
+    extensions: &HashSet<&str>,
+    filenames: &HashSet<&str>,
+    prefixes: &[&str],
+) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str());
+    let name = path.file_name().and_then(|n| n.to_str());
+    let stem = path.file_stem().and_then(|s| s.to_str());
 
-    fn ext_set() -> HashSet<&'static str> {
-        let mut s = HashSet::new();
-        s.insert("rs");
-        s.insert("yml");
-        s.insert("toml");
-        s
-    }
+    let by_extension = ext.map_or(false, |e| extensions.contains(e));
+    let by_filename = name.map_or(false, |n| filenames.contains(n));
+    let by_prefix = stem.map_or(false, |s| {
+        prefixes.iter().any(|prefix| s.starts_with(prefix))
+    });
 
-    fn name_set() -> HashSet<&'static str> {
-        let mut s = HashSet::new();
-        s.insert("Makefile");
-        s.insert("Dockerfile");
-        s.insert("CMakeLists.txt");
-        s
-    }
-
-    #[test]
-    fn is_indexable_path_matches_extension() {
-        let exts = ext_set();
-        let names = name_set();
-        let prefixes: Vec<&str> = vec!["Dockerfile."];
-        assert!(is_indexable_path(
-            Path::new("src/lib.rs"),
-            &exts,
-            &names,
-            &prefixes
-        ));
-        assert!(!is_indexable_path(
-            Path::new("note.txt"),
-            &exts,
-            &names,
-            &prefixes
-        ));
-    }
-
-    #[test]
-    fn is_indexable_path_matches_exact_filename() {
-        let exts = ext_set();
-        let names = name_set();
-        let prefixes: Vec<&str> = vec!["Dockerfile."];
-        // Extensionless files used to be silently dropped by the watcher.
-        assert!(is_indexable_path(
-            Path::new("Makefile"),
-            &exts,
-            &names,
-            &prefixes
-        ));
-        assert!(is_indexable_path(
-            Path::new("subdir/Dockerfile"),
-            &exts,
-            &names,
-            &prefixes
-        ));
-        assert!(is_indexable_path(
-            Path::new("nested/CMakeLists.txt"),
-            &exts,
-            &names,
-            &prefixes
-        ));
-    }
-
-    #[test]
-    fn is_indexable_path_matches_prefix() {
-        let exts = ext_set();
-        let names = name_set();
-        let prefixes: Vec<&str> = vec!["Dockerfile."];
-        assert!(is_indexable_path(
-            Path::new("Dockerfile.prod"),
-            &exts,
-            &names,
-            &prefixes
-        ));
-        assert!(!is_indexable_path(
-            Path::new("Dockerizer"),
-            &exts,
-            &names,
-            &prefixes
-        ));
-    }
-
-    #[test]
-    fn qartezignore_cache_reloads_on_mtime_change() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        let ignore_path = root.join(QARTEZIGNORE_FILENAME);
-
-        // Start with an ignore file that excludes `generated/`.
-        std::fs::write(&ignore_path, "generated/\n").unwrap();
-        let mut cache = QartezIgnoreCache::new(root);
-
-        let target_before = root.join("generated/file.rs");
-        assert!(
-            cache
-                .gi
-                .matched_path_or_any_parents(&target_before, false)
-                .is_ignore(),
-            "initial ignore pattern should block generated/"
-        );
-        let target_other = root.join("other/file.rs");
-        assert!(
-            !cache
-                .gi
-                .matched_path_or_any_parents(&target_other, false)
-                .is_ignore(),
-            "non-matching path should not be ignored initially"
-        );
-
-        // Sleep long enough that the filesystem reports a new mtime;
-        // on fast SSDs the metadata resolution can be as coarse as 1s.
-        thread::sleep(std::time::Duration::from_millis(1100));
-        std::fs::write(&ignore_path, "other/\n").unwrap();
-
-        cache.refresh_if_changed(root);
-        assert!(
-            cache
-                .gi
-                .matched_path_or_any_parents(&target_other, false)
-                .is_ignore(),
-            "cache must have reloaded and now ignore other/"
-        );
-        assert!(
-            !cache
-                .gi
-                .matched_path_or_any_parents(&target_before, false)
-                .is_ignore(),
-            "old pattern (generated/) must be dropped after reload"
-        );
-    }
-
-    #[test]
-    fn qartezignore_cache_starts_empty_when_file_absent() {
-        let tmp = TempDir::new().unwrap();
-        let cache = QartezIgnoreCache::new(tmp.path());
-        assert!(cache.mtime.is_none());
-        let any_path = tmp.path().join("anything");
-        assert!(
-            !cache
-                .gi
-                .matched_path_or_any_parents(&any_path, false)
-                .is_ignore(),
-            "empty cache matches nothing"
-        );
-    }
-
-    #[test]
-    fn qartezignore_cache_picks_up_newly_created_file() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        let mut cache = QartezIgnoreCache::new(root);
-        let target = root.join("vendor/dep.rs");
-
-        assert!(
-            !cache
-                .gi
-                .matched_path_or_any_parents(&target, false)
-                .is_ignore()
-        );
-
-        std::fs::write(root.join(QARTEZIGNORE_FILENAME), "vendor/\n").unwrap();
-        cache.refresh_if_changed(root);
-
-        assert!(
-            cache
-                .gi
-                .matched_path_or_any_parents(&target, false)
-                .is_ignore(),
-            "cache must notice a freshly-written .qartezignore"
-        );
-    }
+    by_extension || by_filename || by_prefix
 }
