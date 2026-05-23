@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use ignore::gitignore::Gitignore;
 use notify::event::{ModifyKind, RenameMode};
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
+use notify::{Event, EventKind, RecommendedWatcher};
 use rusqlite::Connection;
 use tokio::sync::mpsc;
 
@@ -292,14 +292,14 @@ impl Watcher {
                 deleted,
                 self.writer_chunk_size,
             )?;
-            graph::pagerank::compute_pagerank(&conn, &Default::default())?;
-            graph::pagerank::compute_symbol_pagerank(&conn, &Default::default())?;
+            graph::pagerank::compute_pagerank(conn, &Default::default())?;
+            graph::pagerank::compute_symbol_pagerank(conn, &Default::default())?;
             Ok::<(), anyhow::Error>(())
         })();
 
         // Reset writer_state to Idle after batch completes (success or failure).
         if let Err(e) =
-            crate::storage::write::set_writer_state(&conn, crate::readiness::WriterState::Idle)
+            crate::storage::write::set_writer_state(conn, crate::readiness::WriterState::Idle)
         {
             tracing::warn!("watcher: failed to reset writer_state to Idle: {e}");
         }

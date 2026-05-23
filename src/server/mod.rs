@@ -234,7 +234,7 @@ impl QartezServer {
         let db_path = conn
             .path()
             .filter(|s| !s.is_empty())
-            .map(|s| PathBuf::from(s));
+            .map(PathBuf::from);
 
         Self {
             db: Arc::new(Mutex::new(conn)),
