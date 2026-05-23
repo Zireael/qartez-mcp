@@ -455,9 +455,7 @@ fn is_interesting_path(
 
     let by_extension = ext.is_some_and(|e| extensions.contains(e));
     let by_filename = name.is_some_and(|n| filenames.contains(n));
-    let by_prefix = stem.is_some_and(|s| {
-        prefixes.iter().any(|prefix| s.starts_with(prefix))
-    });
+    let by_prefix = stem.is_some_and(|s| prefixes.iter().any(|prefix| s.starts_with(prefix)));
 
     by_extension || by_filename || by_prefix
 }
