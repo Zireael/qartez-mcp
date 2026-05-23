@@ -231,10 +231,7 @@ impl QartezServer {
         // watcher its own dedicated SQLite connection for production
         // databases.  In-memory connections (tests) return `None` and
         // the watcher falls back to the shared connection.
-        let db_path = conn
-            .path()
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from);
+        let db_path = conn.path().filter(|s| !s.is_empty()).map(PathBuf::from);
 
         Self {
             db: Arc::new(Mutex::new(conn)),
