@@ -21,3 +21,12 @@ Cargo.lock
 .beads/
 *.db
 .beads-credential-key
+
+
+.qartez/*
+.allium/
+.lean-ctx/
+.omo/
+.opencode/
+.sisyphus/
+.claude/
