@@ -1,15 +1,10 @@
 name: CI
 
 on:
-  push:
-    # `release/*` is required for the branch-first release gate in
-    # scripts/release.sh: the release commit is pushed to a
-    # `release/vX.Y.Z` branch and the script waits for this CI run to
-    # go green before tagging `main`. Without the glob, CI skips the
-    # branch push and the script times out waiting for a run that
-    # never started.
-    branches: [main, 'release/*']
-  pull_request:
+  # Automatic triggers (push / pull_request / schedule / release /
+  # workflow_run / ...) were removed on 2026-10-31. This workflow now
+  # runs only when started by hand: Actions tab -> Run workflow, or
+  # `gh workflow run <file>`.
   workflow_dispatch:
 
 permissions:
